@@ -1,0 +1,73 @@
+-- Script corrigido a partir do reverter anexado.
+-- Ajuste: documentos/itens sao apagados antes de produto para evitar FK.
+-- Se a tentativa anterior deu erro dentro de BEGIN, este ROLLBACK limpa a transacao abortada.
+ROLLBACK;
+
+BEGIN;
+
+DELETE FROM "public"."titulo_receber_historico" WHERE "trh_id" > 2 AND "tenant_id" = 5;
+DELETE FROM "public"."titulo_receber" WHERE "tr_id" > 62210 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."titulo_pagar_historico" WHERE "tph_id" > 60 AND "tenant_id" = 5;
+DELETE FROM "public"."titulo_pagar" WHERE "tp_id" > 98 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."nota_fiscal_saida_item" WHERE "nf_id" > 15965 AND "tenant_id" = 5;
+DELETE FROM "public"."nota_fiscal_saida_info" WHERE "nf_id" > 15965 AND "tenant_id" = 5;
+DELETE FROM "public"."nota_fiscal_saida" WHERE "nf_id" > 15965 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."prevenda_item" WHERE "nr_prevenda" > 211 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."prevenda" WHERE "nr_prevenda" > 211 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."nota_fiscal_entrada_item" WHERE "nf_id" > 948 AND "tenant_id" = 5;
+DELETE FROM "public"."nota_fiscal_entrada" WHERE "nf_id" > 948 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."pedido_compra_item" WHERE "nr_pedido" > 16 AND "tenant_id" = 5;
+DELETE FROM "public"."pedido_compra" WHERE "nr_pedido" > 16 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+
+-- Produtos e dependencias
+DELETE FROM "public"."produto_estoque" WHERE "cd_produto" > 7344 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."produto_preco" WHERE "cd_produto" > 7344 AND "tenant_id" = 5;
+DELETE FROM "public"."produto_colecao" WHERE "cd_produto" > 7344 AND "tenant_id" = 5;
+DELETE FROM "public"."produto_filho" WHERE "cd_produto_filho" > 7344 AND "tenant_id" = 5;
+DELETE FROM "public"."produto_info" WHERE "cd_produto" > 7344 AND "tenant_id" = 5;
+DELETE FROM "public"."produto" WHERE "cd_produto" > 7344 AND "tenant_id" = 5;
+
+-- Relacionamento grade x tamanho
+DELETE FROM "public"."_gradeTotamanho" WHERE "A" > 5 OR "B" > 36;
+
+DELETE FROM "public"."sub_grupo" WHERE "cd_sub_grupo" > 10 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."cliente" WHERE "cd_cliente" > 8150 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."fornecedor" WHERE "cd_fornecedor" > 742 AND "tenant_id" = 5;
+DELETE FROM "public"."usuario" WHERE "cd_usuario" > 50 AND "tenant_id" = 5;
+DELETE FROM "public"."departamento" WHERE "cd_departamento" > 8 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."grupo" WHERE "cd_grupo" > 132 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."marca" WHERE "cd_marca" > 285 AND "tenant_id" = 5;
+DELETE FROM "public"."cor" WHERE "cd_cor" > 30 AND "tenant_id" = 5;
+DELETE FROM "public"."grade" WHERE "cd_grade" > 5 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."tamanho" WHERE "cd_tamanho" > 36 AND "tenant_id" = 5;
+DELETE FROM "public"."unidade" WHERE "cd_unidade" > 22 AND "tenant_id" = 5;
+DELETE FROM "public"."colecao" WHERE "cd_colecao" > 10 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+DELETE FROM "public"."condicao_pagamento_forma" WHERE "cd_condicao_pagto" > 71 AND "tenant_id" = 5;
+DELETE FROM "public"."condicao_pagamento" WHERE "cd_condicao_pagto" > 71 AND "tenant_id" = 5;
+DELETE FROM "public"."banco" WHERE "cd_banco" > 20 AND "tenant_id" = 5 AND "cd_empresa" = 3;
+
+-- Reverter sequences
+SELECT setval('public.produto_cd_produto_seq'::regclass, 7344, true);
+SELECT setval('public.grupo_cd_grupo_seq'::regclass, 132, true);
+SELECT setval('public.marca_cd_marca_seq'::regclass, 285, true);
+SELECT setval('public.cor_cd_cor_seq'::regclass, 30, true);
+SELECT setval('public.departamento_cd_departamento_seq'::regclass, 8, true);
+SELECT setval('public.sub_grupo_cd_sub_grupo_seq'::regclass, 10, true);
+SELECT setval('public.tamanho_cd_tamanho_seq'::regclass, 36, true);
+SELECT setval('public.unidade_cd_unidade_seq'::regclass, 22, true);
+SELECT setval('public.colecao_cd_colecao_seq'::regclass, 10, true);
+SELECT setval('public.grade_cd_grade_seq'::regclass, 5, true);
+SELECT setval('public.fornecedor_cd_fornecedor_seq'::regclass, 742, true);
+SELECT setval('public.usuario_cd_usuario_seq'::regclass, 50, true);
+SELECT setval('public.cliente_cd_cliente_seq'::regclass, 8150, true);
+SELECT setval('public.banco_cd_banco_seq'::regclass, 20, true);
+SELECT setval('public.condicao_pagamento_cd_condicao_pagto_seq'::regclass, 71, true);
+SELECT setval('public.nota_fiscal_entrada_nf_id_seq'::regclass, 948, true);
+SELECT setval('public.prevenda_nr_prevenda_seq'::regclass, 211, true);
+SELECT setval('public.nota_fiscal_saida_nf_id_seq'::regclass, 15965, true);
+SELECT setval('public.titulo_receber_tr_id_seq'::regclass, 62210, true);
+SELECT setval('public.titulo_pagar_tp_id_seq'::regclass, 98, true);
+SELECT setval('public.titulo_receber_historico_trh_id_seq'::regclass, 2, true);
+SELECT setval('public.titulo_pagar_historico_tph_id_seq'::regclass, 60, true);
+
+COMMIT;

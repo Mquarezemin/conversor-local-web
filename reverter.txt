@@ -1,0 +1,62 @@
+-- Script gerado automaticamente pelo converter.py
+-- Gerado em: 2026-07-01T17:34:18
+-- Snapshot anterior capturado em: 2026-07-01T17:34:06
+-- Tipo: reversao de criacao/importacao de empresa
+-- tenant_id vinculado: 6
+-- cd_empresa criada: 7
+-- Execute somente depois de conferir o banco alvo.
+-- CEPs nao sao removidos automaticamente por serem cadastro compartilhado.
+-- O tenant vinculado nao sera removido por esta reversao.
+
+BEGIN;
+
+DELETE FROM "public"."condicao_pagamento_forma" WHERE "cd_condicao_pagto" > 82 AND "tenant_id" = 6;
+DELETE FROM "public"."sys_config_values" WHERE "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."sequencial_nota_fiscal" WHERE "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."tenant_sequencial_empresa" WHERE "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."sequencial" WHERE "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."local_estoque" WHERE "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."situacao_tributaria" WHERE "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."cliente" WHERE "cd_cliente" > 11893 AND "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."banco_conta" WHERE "cd_conta" > 8 AND "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."banco" WHERE "cd_banco" > 36 AND "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."caixa" WHERE "cd_caixa" > 7 AND "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."grade" WHERE "cd_grade" > 11 AND "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."grupo" WHERE "cd_grupo" > 136 AND "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."departamento" WHERE "cd_departamento" > 15 AND "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."colecao" WHERE "cd_colecao" > 16 AND "tenant_id" = 6 AND "cd_empresa" = 7;
+DELETE FROM "public"."operacao_estoque" WHERE "cd_operacao_estoque" > 46 AND "tenant_id" = 6;
+DELETE FROM "public"."forma_pagamento" WHERE "cd_forma_pagto" > 32 AND "tenant_id" = 6;
+DELETE FROM "public"."condicao_pagamento" WHERE "cd_condicao_pagto" > 82 AND "tenant_id" = 6;
+DELETE FROM "public"."tabela_preco" WHERE "cd_tabela_preco" > 6 AND "tenant_id" = 6;
+DELETE FROM "public"."categoria_cliente" WHERE "cd_categoria" > 5 AND "tenant_id" = 6;
+DELETE FROM "public"."marca" WHERE "cd_marca" > 289 AND "tenant_id" = 6;
+DELETE FROM "public"."tamanho" WHERE "cd_tamanho" > 159 AND "tenant_id" = 6;
+DELETE FROM "public"."cor" WHERE "cd_cor" > 302 AND "tenant_id" = 6;
+DELETE FROM "public"."unidade" WHERE "cd_unidade" > 44 AND "tenant_id" = 6;
+DELETE FROM "public"."usuario" WHERE "cd_usuario" > 107 AND "tenant_id" = 6;
+DELETE FROM "public"."empresa" WHERE "cd_empresa" > 6 AND "tenant_id" = 6;
+
+-- Reverter sequences
+SELECT setval('public.tenant_id_seq'::regclass, 8, true);
+SELECT setval('public.empresa_cd_empresa_seq'::regclass, 6, true);
+SELECT setval('public.usuario_cd_usuario_seq'::regclass, 107, true);
+SELECT setval('public.unidade_cd_unidade_seq'::regclass, 44, true);
+SELECT setval('public.cor_cd_cor_seq'::regclass, 302, true);
+SELECT setval('public.tamanho_cd_tamanho_seq'::regclass, 159, true);
+SELECT setval('public.marca_cd_marca_seq'::regclass, 289, true);
+SELECT setval('public.colecao_cd_colecao_seq'::regclass, 16, true);
+SELECT setval('public.departamento_cd_departamento_seq'::regclass, 15, true);
+SELECT setval('public.grupo_cd_grupo_seq'::regclass, 136, true);
+SELECT setval('public.grade_cd_grade_seq'::regclass, 11, true);
+SELECT setval('public.tabela_preco_cd_tabela_preco_seq'::regclass, 6, true);
+SELECT setval('public.condicao_pagamento_cd_condicao_pagto_seq'::regclass, 82, true);
+SELECT setval('public.forma_pagamento_cd_forma_pagto_seq'::regclass, 32, true);
+SELECT setval('public.operacao_estoque_cd_operacao_estoque_seq'::regclass, 46, true);
+SELECT setval('public.caixa_cd_caixa_seq'::regclass, 7, true);
+SELECT setval('public.banco_cd_banco_seq'::regclass, 36, true);
+SELECT setval('public.banco_conta_cd_conta_seq'::regclass, 8, true);
+SELECT setval('public.categoria_cliente_cd_categoria_seq'::regclass, 5, true);
+SELECT setval('public.cliente_cd_cliente_seq'::regclass, 11893, true);
+
+COMMIT;
