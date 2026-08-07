@@ -1,0 +1,126 @@
+-- Script gerado automaticamente pelo converter.py
+-- Gerado em: 2026-08-07T16:50:11
+-- Snapshot anterior capturado em: 2026-08-07T16:32:53
+-- tenant_id: 8
+-- cd_empresa: 7
+-- Execute somente depois de conferir o banco alvo.
+-- CEPs cadastrados pela API nao sao removidos automaticamente por serem cadastro compartilhado.
+
+BEGIN;
+
+-- Dependencias por cliente convertido
+DELETE FROM "public"."condicional_item" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nr_condicional" IN (SELECT "nr_condicional" FROM "public"."condicional" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084);
+DELETE FROM "public"."condicional" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084;
+DELETE FROM "public"."prevenda_item" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nr_prevenda" IN (SELECT "nr_prevenda" FROM "public"."prevenda" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084);
+DELETE FROM "public"."prevenda" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084;
+DELETE FROM "public"."prevenda_item" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nr_prevenda" IN (SELECT "nr_prevenda" FROM "public"."prevenda" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nf_id_documento_fiscal" IN (SELECT "nf_id" FROM "public"."nota_fiscal_saida" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084));
+DELETE FROM "public"."prevenda" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nf_id_documento_fiscal" IN (SELECT "nf_id" FROM "public"."nota_fiscal_saida" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084);
+DELETE FROM "public"."titulo_receber_historico" WHERE "tenant_id" = 8 AND "tr_id" IN (SELECT "tr_id" FROM "public"."titulo_receber" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nf_id" IN (SELECT "nf_id" FROM "public"."nota_fiscal_saida" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084));
+DELETE FROM "public"."titulo_receber" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nf_id" IN (SELECT "nf_id" FROM "public"."nota_fiscal_saida" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084);
+DELETE FROM "public"."nota_fiscal_saida_item" WHERE "tenant_id" = 8 AND "nf_id" IN (SELECT "nf_id" FROM "public"."nota_fiscal_saida" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084);
+DELETE FROM "public"."nota_fiscal_saida_info" WHERE "tenant_id" = 8 AND "nf_id" IN (SELECT "nf_id" FROM "public"."nota_fiscal_saida" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084);
+DELETE FROM "public"."nota_fiscal_saida_info" WHERE "clienteCd_cliente" > 13084 AND "tenant_id" = 8;
+DELETE FROM "public"."nota_fiscal_saida" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084;
+DELETE FROM "public"."titulo_receber_historico" WHERE "tenant_id" = 8 AND "tr_id" IN (SELECT "tr_id" FROM "public"."titulo_receber" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084);
+DELETE FROM "public"."titulo_receber" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_cliente" > 13084;
+
+-- Dependencias por fornecedor convertido
+DELETE FROM "public"."pedido_compra_item" WHERE "tenant_id" = 8 AND "nr_pedido" IN (SELECT "nr_pedido" FROM "public"."pedido_compra" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND ("cd_fornecedor" > 1067 OR "cd_transportador" > 1067));
+DELETE FROM "public"."pedido_compra" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND ("cd_fornecedor" > 1067 OR "cd_transportador" > 1067);
+DELETE FROM "public"."titulo_pagar_historico" WHERE "tenant_id" = 8 AND "tp_id" IN (SELECT "tp_id" FROM "public"."titulo_pagar" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nf_id_entrada" IN (SELECT "nf_id" FROM "public"."nota_fiscal_entrada" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND ("cd_fornecedor" > 1067 OR "cd_transportador" > 1067)));
+DELETE FROM "public"."titulo_pagar" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nf_id_entrada" IN (SELECT "nf_id" FROM "public"."nota_fiscal_entrada" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND ("cd_fornecedor" > 1067 OR "cd_transportador" > 1067));
+DELETE FROM "public"."nota_fiscal_entrada_item" WHERE "tenant_id" = 8 AND "nf_id" IN (SELECT "nf_id" FROM "public"."nota_fiscal_entrada" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND ("cd_fornecedor" > 1067 OR "cd_transportador" > 1067));
+DELETE FROM "public"."nota_fiscal_entrada" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND ("cd_fornecedor" > 1067 OR "cd_transportador" > 1067);
+DELETE FROM "public"."titulo_pagar_historico" WHERE "tenant_id" = 8 AND "tp_id" IN (SELECT "tp_id" FROM "public"."titulo_pagar" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_fornecedor" > 1067);
+DELETE FROM "public"."titulo_pagar" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_fornecedor" > 1067;
+DELETE FROM "public"."nota_fiscal_saida_info" WHERE "cd_transportador" > 1067 AND "tenant_id" = 8;
+
+-- Dependencias por administradora de cartao convertida
+DELETE FROM "public"."prevenda_item" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "nr_prevenda" IN (SELECT "nr_prevenda" FROM "public"."prevenda" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_administradora" > 19);
+DELETE FROM "public"."prevenda" WHERE "tenant_id" = 8 AND "cd_empresa" = 7 AND "cd_administradora" > 19;
+
+DELETE FROM "public"."titulo_receber_historico" WHERE "trh_id" > 346 AND "tenant_id" = 8;
+DELETE FROM "public"."titulo_receber" WHERE "tr_id" > 210686 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."titulo_pagar_historico" WHERE "tph_id" > 159 AND "tenant_id" = 8;
+DELETE FROM "public"."titulo_pagar" WHERE "tp_id" > 173 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."condicional_item" WHERE "nr_condicional" > 11 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."condicional" WHERE "nr_condicional" > 11 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."nota_fiscal_saida_item" WHERE "nf_id" > 62088 AND "tenant_id" = 8;
+DELETE FROM "public"."nota_fiscal_saida_info" WHERE "nf_id" > 62088 AND "tenant_id" = 8;
+DELETE FROM "public"."nota_fiscal_saida" WHERE "nf_id" > 62088 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."prevenda_item" WHERE "nr_prevenda" > 330 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."prevenda" WHERE "nr_prevenda" > 330 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."nota_fiscal_entrada_item" WHERE "nf_id" > 1824 AND "tenant_id" = 8;
+DELETE FROM "public"."nota_fiscal_entrada" WHERE "nf_id" > 1824 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."pedido_compra_item" WHERE "nr_pedido" > 18 AND "tenant_id" = 8;
+DELETE FROM "public"."pedido_compra" WHERE "nr_pedido" > 18 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+
+-- Produtos e dependencias
+DELETE FROM "public"."condicional_item" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."pedido_compra_item" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."nota_fiscal_entrada_item" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."prevenda_item" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."nota_fiscal_saida_item" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."orcamento_item" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."inventario_estoque_item" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."movimento_estoque" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."produto_local_estoque" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."produto_estoque" WHERE "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."produto_preco" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."produto_colecao" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."produto_filho" WHERE "cd_produto_filho" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."produto_filho" WHERE "cd_produto_pai" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."produto_info" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+DELETE FROM "public"."produto" WHERE "cd_produto" > 353812 AND "tenant_id" = 8;
+
+-- Relacionamento grade x tamanho
+DELETE FROM "public"."_gradeTotamanho" WHERE "A" > 20 OR "B" > 157;
+
+DELETE FROM "public"."sub_grupo" WHERE "cd_sub_grupo" > 62 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."cliente" WHERE "cd_cliente" > 13084 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."fornecedor" WHERE "cd_fornecedor" > 1067 AND "tenant_id" = 8;
+DELETE FROM "public"."usuario" WHERE "cd_usuario" > 109 AND "tenant_id" = 8;
+DELETE FROM "public"."departamento" WHERE "cd_departamento" > 24 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."grupo" WHERE "cd_grupo" > 167 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."marca" WHERE "cd_marca" > 293 AND "tenant_id" = 8;
+DELETE FROM "public"."cor" WHERE "cd_cor" > 2016 AND "tenant_id" = 8;
+DELETE FROM "public"."grade" WHERE "cd_grade" > 20 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."tamanho" WHERE "cd_tamanho" > 157 AND "tenant_id" = 8;
+DELETE FROM "public"."unidade" WHERE "cd_unidade" > 43 AND "tenant_id" = 8;
+DELETE FROM "public"."colecao" WHERE "cd_colecao" > 25 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."condicao_pagamento_forma" WHERE "cd_condicao_pagto" > 88 AND "tenant_id" = 8;
+DELETE FROM "public"."condicao_pagamento" WHERE "cd_condicao_pagto" > 88 AND "tenant_id" = 8;
+DELETE FROM "public"."forma_pagamento" WHERE "cd_forma_pagto" > 46 AND "tenant_id" = 8;
+DELETE FROM "public"."cartao_administradora" WHERE "cd_administradora" > 19 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."banco_conta" WHERE "cd_conta" > 9 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+DELETE FROM "public"."banco" WHERE "cd_banco" > 62 AND "tenant_id" = 8 AND "cd_empresa" = 7;
+
+-- Reverter sequences
+SELECT setval('public.produto_cd_produto_seq'::regclass, 353812, true);
+SELECT setval('public.grupo_cd_grupo_seq'::regclass, 167, true);
+SELECT setval('public.marca_cd_marca_seq'::regclass, 293, true);
+SELECT setval('public.cor_cd_cor_seq'::regclass, 2016, true);
+SELECT setval('public.departamento_cd_departamento_seq'::regclass, 24, true);
+SELECT setval('public.sub_grupo_cd_sub_grupo_seq'::regclass, 62, true);
+SELECT setval('public.tamanho_cd_tamanho_seq'::regclass, 157, true);
+SELECT setval('public.unidade_cd_unidade_seq'::regclass, 43, true);
+SELECT setval('public.colecao_cd_colecao_seq'::regclass, 25, true);
+SELECT setval('public.grade_cd_grade_seq'::regclass, 20, true);
+SELECT setval('public.fornecedor_cd_fornecedor_seq'::regclass, 1067, true);
+SELECT setval('public.usuario_cd_usuario_seq'::regclass, 109, true);
+SELECT setval('public.cliente_cd_cliente_seq'::regclass, 13084, true);
+SELECT setval('public.banco_cd_banco_seq'::regclass, 62, true);
+SELECT setval('public.banco_conta_cd_conta_seq'::regclass, 9, true);
+SELECT setval('public.condicao_pagamento_cd_condicao_pagto_seq'::regclass, 88, true);
+SELECT setval('public.forma_pagamento_cd_forma_pagto_seq'::regclass, 46, true);
+SELECT setval('public.cartao_administradora_cd_administradora_seq'::regclass, 19, true);
+SELECT setval('public.condicional_nr_condicional_seq'::regclass, 11, true);
+SELECT setval('public.nota_fiscal_entrada_nf_id_seq'::regclass, 1824, true);
+SELECT setval('public.prevenda_nr_prevenda_seq'::regclass, 330, true);
+SELECT setval('public.nota_fiscal_saida_nf_id_seq'::regclass, 62088, true);
+SELECT setval('public.titulo_receber_tr_id_seq'::regclass, 210686, true);
+SELECT setval('public.titulo_pagar_tp_id_seq'::regclass, 173, true);
+SELECT setval('public.titulo_receber_historico_trh_id_seq'::regclass, 346, true);
+SELECT setval('public.titulo_pagar_historico_tph_id_seq'::regclass, 159, true);
+
+COMMIT;

@@ -821,6 +821,23 @@ def valor_decimal_ou_zero(valor):
     return valor
 
 
+def valor_decimal_campo_giv(registro, campo_principal, *campos_legado):
+    """Le o campo numerico oficial do GIV sem somar aliases legados.
+
+    Algumas tabelas antigas mantem colunas com nomes parecidos, por exemplo
+    ``vl_outras_despesas`` e ``vl_outro``. Quando a coluna oficial existe, um
+    zero nela e um valor valido e nao pode disparar fallback para o alias. Os
+    procedimentos de relatorio do GIV usam o campo oficial; o fallback fica
+    restrito a bancos/schema antigos em que essa coluna realmente nao exista.
+    """
+    if campo_principal in registro:
+        return valor_decimal_ou_zero(registro.get(campo_principal))
+    for campo_legado in campos_legado:
+        if campo_legado in registro:
+            return valor_decimal_ou_zero(registro.get(campo_legado))
+    return Decimal('0')
+
+
 def valor_inteiro_ou_zero(valor):
     """Retorna inteiro ou zero quando o valor estiver vazio/invalido."""
     if valor is None:
@@ -9135,7 +9152,11 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
             'tp_frete': 'N',
             'vl_frete': valor_decimal_ou_zero(nota.get('vl_frete')),
             'vl_desconto': valor_decimal_ou_zero(nota.get('vl_desconto')),
-            'vl_outras_despesas': valor_decimal_ou_zero(nota.get('vl_outras_despesas') or nota.get('vl_outra_despesa')),
+            'vl_outras_despesas': valor_decimal_campo_giv(
+                nota,
+                'vl_outras_despesas',
+                'vl_outra_despesa'
+            ),
             'vl_total_produto': valor_decimal_ou_zero(nota.get('vl_produto')),
             'vl_total_nota': valor_decimal_ou_zero(nota.get('vl_total_nota')),
             'vl_base_icms': valor_decimal_ou_zero(nota.get('vl_base_icms')),
@@ -9202,7 +9223,11 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
             'vl_custo_unitario': valor_decimal_ou_zero(item.get('vl_custo_unitario') or item.get('vl_custo') or item.get('vl_unitario')),
             'vl_desconto': valor_decimal_ou_zero(item.get('vl_desconto')),
             'vl_frete': valor_decimal_ou_zero(item.get('vl_frete')),
-            'vl_outras_despesas': valor_decimal_ou_zero(item.get('vl_outras_despesas') or item.get('vl_outro')),
+            'vl_outras_despesas': valor_decimal_campo_giv(
+                item,
+                'vl_outras_despesas',
+                'vl_outro'
+            ),
             'vl_base_icms': valor_decimal_ou_zero(item.get('vl_base_icms')),
             'pr_icms': valor_decimal_ou_zero(item.get('pr_icms')),
             'pr_reducao_icms': valor_decimal_ou_zero(item.get('pr_reducao_icms')),
@@ -11483,6 +11508,109 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
             """,
             (tenant_id,)
         )
+        # pr_rel_pedido_compra calcula o valor por situacao com:
+        # Round(vl_unitario * (1 + pr_ipi / 100) * quantidade, 2).
+        adicionar_validacao(
+            validacoes,
+            'pedido_compra_item',
+            'pedido_compra_relatorio',
+            tabelas_web.get('pedido_compra_item'),
+            [('qtd', 'count'), ('vl_relatorio', 'decimal')],
+            f"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(ROUND(
+                    vl_unitario * (1 + pr_ipi / 100) * qt_pedida,
+                    2
+                )), 0)
+              FROM pedido_compra_item
+             WHERE cd_empresa = {cd_empresa_giv}
+            """,
+            f"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(ROUND(
+                    vl_unitario * (1 + pr_ipi / 100) * qt_produto,
+                    2
+                )), 0)
+              FROM {tabelas_web.get('pedido_compra_item')}
+             WHERE tenant_id = %s
+            """,
+            (tenant_id,)
+        )
+        # Formula usada por pr_rel_nota_fiscal_entrada no GIV:
+        # Round(Round(vl_unitario * qt_produto, 2) - vl_desconto
+        #       + vl_substituicao + vl_ipi
+        #       + frete condicionado ao cabecalho
+        #       + vl_outras_despesas, 2).
+        # O schema Web atual nao possui vl_substituicao no item; o GIV desta
+        # conversao tem esse componente zerado. Mantemos 0 explicito para que
+        # uma futura base com substituicao diferente de zero seja denunciada.
+        adicionar_validacao(
+            validacoes,
+            'nota_fiscal_entrada_item',
+            'nota_fiscal_entrada_relatorio',
+            tabelas_web.get('nota_fiscal_entrada_item'),
+            [
+                ('qtd', 'count'),
+                ('qt_produto', 'decimal'),
+                ('vl_relatorio', 'decimal'),
+                ('vl_ipi', 'decimal'),
+                ('vl_frete', 'decimal'),
+                ('vl_outras_despesas', 'decimal'),
+            ],
+            f"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(i.qt_produto), 0),
+                COALESCE(SUM(ROUND(
+                    ROUND(i.vl_unitario * i.qt_produto, 2)
+                    - i.vl_desconto
+                    + i.vl_substituicao
+                    + i.vl_ipi
+                    + CASE WHEN n.id_soma_frete_total_nota = 'S'
+                           THEN i.vl_frete ELSE 0 END
+                    + i.vl_outras_despesas,
+                    2
+                )), 0),
+                COALESCE(SUM(i.vl_ipi), 0),
+                COALESCE(SUM(i.vl_frete), 0),
+                COALESCE(SUM(i.vl_outras_despesas), 0)
+              FROM nota_fiscal_entrada_item i
+              JOIN nota_fiscal_entrada n ON
+                   n.nr_nota = i.nr_nota
+               AND n.serie = i.serie
+               AND n.cd_empresa = i.cd_empresa
+               AND n.cd_fornecedor = i.cd_fornecedor
+               AND n.id_pessoa = i.id_pessoa
+             WHERE n.cd_empresa = {cd_empresa_giv}
+            """,
+            f"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(i.qt_produto), 0),
+                COALESCE(SUM(ROUND(
+                    ROUND(i.vl_unitario * i.qt_produto, 2)
+                    - i.vl_desconto
+                    + 0
+                    + i.vl_ipi
+                    + CASE WHEN n.id_soma_frete_total_nota = 'S'
+                           THEN i.vl_frete ELSE 0 END
+                    + i.vl_outras_despesas,
+                    2
+                )), 0),
+                COALESCE(SUM(i.vl_ipi), 0),
+                COALESCE(SUM(i.vl_frete), 0),
+                COALESCE(SUM(i.vl_outras_despesas), 0)
+              FROM {tabelas_web.get('nota_fiscal_entrada_item')} i
+              JOIN {tabelas_web.get('nota_fiscal_entrada')} n ON
+                   n.nf_id = i.nf_id
+               AND n.tenant_id = i.tenant_id
+             WHERE i.tenant_id = %s
+               AND n.cd_empresa = %s
+            """,
+            (tenant_id, cd_empresa)
+        )
 
     if 'prevenda' in tabelas_selecionadas:
         adicionar_validacao(
@@ -11662,6 +11790,117 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
              WHERE tenant_id = %s
             """,
             (tenant_id,)
+        )
+        # pr_rel_nota_fiscal_saida calcula o produto, PIS/COFINS e a nota a
+        # partir dos valores do item; nao usa apenas o total do cabecalho.
+        adicionar_validacao(
+            validacoes,
+            'nota_fiscal_saida_item',
+            'nota_fiscal_saida_relatorio',
+            tabelas_web.get('nota_fiscal_saida_item'),
+            [
+                ('qtd', 'count'),
+                ('qt_produto', 'decimal'),
+                ('vl_produto_relatorio', 'decimal'),
+                ('vl_pis_relatorio', 'decimal'),
+                ('vl_cofins_relatorio', 'decimal'),
+                ('vl_frete', 'decimal'),
+                ('vl_ipi', 'decimal'),
+                ('vl_substituicao', 'decimal'),
+                ('vl_outras_despesas', 'decimal'),
+                ('vl_nota_relatorio', 'decimal'),
+            ],
+            f"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(i.qt_produto), 0),
+                COALESCE(SUM(
+                    i.qt_produto * i.vl_unitario
+                    - i.vl_desconto
+                    + i.vl_acrescimo
+                    + i.vl_acrescimo_financeiro
+                ), 0),
+                COALESCE(SUM(ROUND((
+                    ROUND(i.vl_unitario * i.qt_produto, 2)
+                    - i.vl_desconto
+                    + i.vl_acrescimo
+                    + i.vl_acrescimo_financeiro
+                    + i.vl_frete
+                ) * i.pr_pis / 100, 2)), 0),
+                COALESCE(SUM(ROUND((
+                    ROUND(i.vl_unitario * i.qt_produto, 2)
+                    - i.vl_desconto
+                    + i.vl_acrescimo
+                    + i.vl_acrescimo_financeiro
+                    + i.vl_frete
+                ) * i.pr_cofins / 100, 2)), 0),
+                COALESCE(SUM(i.vl_frete), 0),
+                COALESCE(SUM(i.vl_ipi), 0),
+                COALESCE(SUM(i.vl_substituicao), 0),
+                COALESCE(SUM(i.vl_outras_despesas), 0),
+                COALESCE(SUM(
+                    i.qt_produto * i.vl_unitario
+                    - i.vl_desconto
+                    + i.vl_acrescimo
+                    + i.vl_acrescimo_financeiro
+                    + i.vl_ipi
+                    + i.vl_substituicao
+                    + i.vl_frete
+                    + i.vl_outras_despesas
+                ), 0)
+              FROM nota_fiscal_saida_item i
+              JOIN nota_fiscal_saida n ON
+                   n.nr_nota = i.nr_nota
+               AND n.serie = i.serie
+               AND n.cd_empresa = i.cd_empresa
+             WHERE n.cd_empresa = {cd_empresa_giv}
+            """,
+            f"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(i.qt_produto), 0),
+                COALESCE(SUM(
+                    i.qt_produto * i.vl_unitario
+                    - i.vl_desconto
+                    + i.vl_acrescimo_produto
+                    + i.vl_acrescimo_financeiro
+                ), 0),
+                COALESCE(SUM(ROUND((
+                    ROUND(i.vl_unitario * i.qt_produto, 2)
+                    - i.vl_desconto
+                    + i.vl_acrescimo_produto
+                    + i.vl_acrescimo_financeiro
+                    + i.vl_frete
+                ) * i.pr_pis / 100, 2)), 0),
+                COALESCE(SUM(ROUND((
+                    ROUND(i.vl_unitario * i.qt_produto, 2)
+                    - i.vl_desconto
+                    + i.vl_acrescimo_produto
+                    + i.vl_acrescimo_financeiro
+                    + i.vl_frete
+                ) * i.pr_cofins / 100, 2)), 0),
+                COALESCE(SUM(i.vl_frete), 0),
+                COALESCE(SUM(i.vl_ipi), 0),
+                COALESCE(SUM(i.vl_substituicao), 0),
+                COALESCE(SUM(i.vl_outras_despesas), 0),
+                COALESCE(SUM(
+                    i.qt_produto * i.vl_unitario
+                    - i.vl_desconto
+                    + i.vl_acrescimo_produto
+                    + i.vl_acrescimo_financeiro
+                    + i.vl_ipi
+                    + i.vl_substituicao
+                    + i.vl_frete
+                    + i.vl_outras_despesas
+                ), 0)
+              FROM {tabelas_web.get('nota_fiscal_saida_item')} i
+              JOIN {tabelas_web.get('nota_fiscal_saida')} n ON
+                   n.nf_id = i.nf_id
+               AND n.tenant_id = i.tenant_id
+             WHERE i.tenant_id = %s
+               AND n.cd_empresa = %s
+            """,
+            (tenant_id, cd_empresa)
         )
 
     if 'banco_conta' in tabelas_selecionadas:

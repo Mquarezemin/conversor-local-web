@@ -1,0 +1,220 @@
+AUDITORIA GIV -> WEB - AJUSTES NECESSARIOS NO projeto_v1
+Data da auditoria: 07/08/2026
+Escopo: tenant_id=8, cd_empresa Web=7, cd_empresa GIV=1.
+
+IMPORTANTE
+----------
+Nenhum arquivo do projeto_v1 foi alterado nesta auditoria.
+Este arquivo e somente um roteiro tecnico para os ajustes posteriores.
+O projeto_v1 ja possuia alteracoes locais anteriores nas rotinas de saldo de estoque;
+elas foram preservadas.
+
+1. CONCLUSAO DOS ITENS DA NOTA FISCAL DE SAIDA
+-----------------------------------------------
+Problema confirmado na tela/detalhamento do projeto_v1, nao na conversao.
+
+O banco GIV e o banco Web possuem os mesmos valores dos itens. O detalhamento
+do Web esta mostrando o valor bruto (quantidade x valor unitario), enquanto o
+cabecalho mostra o valor liquido da nota, depois do desconto.
+
+Exemplos conferidos:
+
+- NF 1602, serie NFC1:
+  bruto dos itens = R$ 6.070,00
+  desconto dos itens = R$ 3.448,00
+  liquido da nota = R$ 2.622,00
+  A tela mostra R$ 6.070,00 nos itens, mas o cabecalho mostra R$ 2.622,00.
+
+- NF 3164, serie D1:
+  bruto dos itens = R$ 1.706,00
+  desconto = R$ 1.406,00
+  liquido = R$ 300,00
+
+- NF 3161, serie D1:
+  bruto do item = R$ 638,00
+  desconto = R$ 488,00
+  liquido = R$ 150,00
+
+Arquivo principal:
+C:\Users\conversao01\Desktop\projeto_v1\src\adapters\outbound\repositories\notaFiscalSaidaRepository.ts
+
+Ajustes em obterPorId(), aproximadamente linhas 952-1023:
+
+1) Incluir na selecao de nota_fiscal_saida_item os campos usados no calculo:
+   - vl_desconto
+   - vl_acrescimo_produto
+   - vl_acrescimo_financeiro
+   - vl_frete
+   - vl_outras_despesas
+   - vl_ipi
+   - vl_substituicao
+
+2) Calcular o total do item usando a mesma regra de itemValues(), ja existente
+   no proprio repositorio, aproximadamente linhas 118-152:
+
+   vl_produto = (qt_produto * vl_unitario) - vl_desconto
+                + vl_acrescimo_produto + vl_acrescimo_financeiro
+
+   vl_total = vl_produto + vl_frete + vl_outras_despesas
+              + vl_ipi + vl_substituicao
+
+   Nao usar somente qt_produto * vl_unitario.
+
+3) Corrigir o nome do produto para produtos filhos.
+   Hoje obterPorId() consulta somente produto.produto_info diretamente.
+   Os produtos filhos importados ficam em produto_filho e o nome fica no
+   produto_info do produto pai. Fazer fallback:
+
+   produto direto -> produto_filho.cd_produto_pai -> produto_info do pai.
+
+   Se ainda nao houver nome, exibir um texto neutro com o codigo do produto.
+   Nao usar item.observacao como nome do produto.
+
+   No caso da NF 1602, o texto "3" exibido na coluna Produto veio do campo de
+   observacao/complemento da origem; nao e o nome real dos cinco produtos.
+
+Ajuste adicional no relatorio analitico, aproximadamente linhas 482-503:
+o codigo de produtoNome tambem consulta somente produto_info direto. Aplicar
+o mesmo fallback de produto filho para produto pai nessa rotina.
+
+2. CONTAS A PAGAR - DIFERENCA DO DASHBOARD
+------------------------------------------
+Problema confirmado no projeto_v1, nao na conversao.
+
+O titulo abaixo existe corretamente no Web e no GIV:
+
+  nr_titulo=6869, nr_parcela=3, serie=IMP
+  vencimento=17/05/1818
+  valor em aberto=R$ 1.488,66
+
+Os numeros conferem exatamente:
+
+  dashboard Web: R$ 446.274,34
+  lista GIV/Web com data final 01/01/2000: R$ 444.785,68
+  diferenca: R$ 1.488,66
+
+Ou seja, o dashboard inclui o titulo de 1818 porque busca todos os titulos
+abertos sem limite de data. A tela/lista, quando recebe data final 01/01/2000,
+exclui esse vencimento antigo.
+
+Arquivos envolvidos:
+
+C:\Users\conversao01\Desktop\projeto_v1\src\adapters\outbound\repositories\tituloPagarRepository.ts
+C:\Users\conversao01\Desktop\projeto_v1\src\application\services\DashboardDataService.ts
+
+O que ajustar:
+
+1) Definir uma regra unica para datas invalidas/historicas fora do periodo do
+   sistema. Exemplo: considerar datas anteriores a 01/01/1900 como invalidas,
+   ou exigir um periodo minimo valido para os widgets.
+
+2) Aplicar a mesma regra no relatorio e no dashboard. Hoje o dashboard chama
+   relatorioContasPagar() com situacao="aberto" e sem dtFim, aproximadamente
+   DashboardDataService.ts linhas 82-100.
+
+3) Nao apagar nem alterar silenciosamente o titulo 6869/3. O dado esta correto
+   no banco; o sistema deve exclui-lo dos totais operacionais somente se essa for
+   a regra definida, ou exibi-lo em uma categoria de datas invalidas.
+
+4) Criar teste de regressao garantindo que:
+   - total aberto com a regra atual inclua/exclua o titulo de forma consciente;
+   - lista e dashboard apresentem o mesmo total quando usam o mesmo filtro;
+   - o valor liquido do titulo continue sendo calculado como titulo + acrescimo
+     - desconto - pago.
+
+3. RELATORIO DE NOTAS FISCAIS DE SAIDA
+---------------------------------------
+Os dados dos documentos e itens foram convertidos sem perda referencial:
+
+- notas de saida: GIV 13.237 / Web 13.237
+- itens de saida: GIV 41.836 / Web 41.836
+- notas de entrada: GIV 2.653 / Web 2.653
+- itens de entrada: GIV 33.150 / Web 33.150
+- contas a receber: GIV 23.751 / Web 23.751
+- contas a pagar: GIV 13.032 / Web 13.032
+
+Para o filtro de CFOP usado na tela (5202, 5117, 5152, 5405, 5922, 5933,
+6102, 6108, 6117, 6152, 6405, 6922 e 6933), GIV e Web apresentaram:
+
+- 593 itens
+- quantidade 603
+- valor de produto R$ 179.107,8292
+- valor da nota R$ 182.023,83
+
+Portanto, a divergencia visual dos itens nao e causada pela carga dos itens.
+
+Foi encontrada uma diferenca de regra entre o procedimento antigo do GIV e o
+relatorio sintetico do Web:
+
+- o sintetico do projeto_v1 usa diretamente nota_fiscal_saida.vl_total;
+- o procedimento GIV pr_rel_nota_fiscal_saida aplica filtros de situacao,
+  CF/ECF, serie, D1, CFOP e cancelamentos.
+
+Se a exigencia for igualdade absoluta com o relatorio antigo do GIV, alinhar no
+projeto_v1 os filtros e a formula do procedimento, especialmente:
+
+- tratamento de series CF/CF01 e cancelamento ECF;
+- inclusao/exclusao de D1;
+- situacoes autorizada, pendente, inutilizada e cancelada;
+- exclusao da serie P quando aplicavel;
+- calculo do valor por item com desconto, acrescimos, frete, IPI,
+  substituicao e outras despesas.
+
+O relatorio analitico ja possui itemValues() com a formula detalhada; o modal
+de detalhe precisa reutilizar a mesma regra.
+
+4. PRODUTOS, PRECOS E ESTOQUE
+-----------------------------
+Esta parte nao e problema de tela.
+
+Contagens atuais:
+
+- produtos GIV: 323.598
+- produtos Web: 323.585
+- precos GIV/Web: 323.598 / 323.585
+- estoques GIV/Web: 323.598 / 323.585
+
+Foram identificadas 14 colisoes de variacao: dois codigos GIV diferentes,
+normalmente com cores/tamanhos que acabam no mesmo cadastro auxiliar Web,
+foram relacionados ao mesmo produto filho Web. Os valores dessas duplicidades
+sao iguais e o Web nao consegue manter duas linhas com a mesma combinacao de
+familia, cor e tamanho por causa da restricao de unicidade.
+
+Totais agregados atuais:
+
+                         GIV                 Web                 diferenca Web-GIV
+vl_venda                191.718.569,38      191.712.417,38       -6.152,00
+vl_compra             2.737.670.696,85    2.737.668.174,74       -8.522,11
+vl_custo              2.737.677.337,80    2.737.674.815,69       -2.522,11
+vl_custo_medio        2.737.261.755,93    2.737.257.659,86       -4.096,07
+qt_fisico/disponivel        2.368,00            2.369,00002       +1,00002
+
+Conclusao: esses totais nao devem ser usados para afirmar que a tela de notas
+esta errada. Eles resultam do reaproveitamento de produtos ja existentes no
+tenant e da consolidacao de variacoes que o Web considera iguais. Se for
+obrigatorio que o total bruto de linhas de preco/estoque seja identico ao GIV,
+o conversor precisara de uma etapa explicita de reconciliacao/atualizacao dos
+produtos reaproveitados, ou a carga devera ser feita em um tenant realmente
+limpo. Essa decisao nao deve ser implementada no projeto_v1.
+
+5. RESUMO EXECUTIVO PARA IMPLEMENTACAO
+---------------------------------------
+
+[CORRIGIR NO projeto_v1]
+
+- modal de detalhe da NF: usar descontos/acrescimos/impostos no total do item;
+- resolver nome de produto filho pelo produto pai;
+- nao exibir observacao/complemento como nome do produto;
+- aplicar o mesmo nome pai/filho no relatorio analitico;
+- alinhar filtro de datas do dashboard de contas a pagar com a lista;
+- definir tratamento para vencimentos invalidos, incluindo o titulo 6869/3 de
+  17/05/1818;
+- se necessario, alinhar o sintetico de NF de saida com a procedure do GIV.
+
+[NAO E AJUSTE DO projeto_v1]
+
+- diferenca de 13 linhas de produto/preco/estoque e os totais agregados acima:
+  revisar no conversor/regras de reaproveitamento ou fazer a carga em tenant
+  limpo; nao tentar corrigir isso na tela.
+
+Fim do relatorio.
