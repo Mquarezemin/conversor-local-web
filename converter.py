@@ -6976,25 +6976,32 @@ def map_status_titulo_receber(status, vl_titulo, vl_pago):
 
 
 def calcular_valores_titulo_receber(titulo):
-    """Monta valores do contas a receber separando original, desconto e acrescimo."""
-    vl_original = valor_decimal_ou_zero(titulo.get('vl_original'))
-    if vl_original == 0:
-        vl_original = valor_decimal_ou_zero(titulo.get('vl_titulo'))
+    """
+    Monta os valores do contas a receber com a MESMA composicao usada pelos
+    relatorios do proprio GIV:
 
+        saldo = vl_titulo - vl_desconto + vl_acrescimo - vl_pago
+
+    (procedures pr_rel_balanco_patrimonial e pr_rel_fluxo_caixa_novo).
+
+    Ponto critico: no GIV, "vl_original" e o valor TOTAL da venda, repetido
+    identico em todas as parcelas do mesmo documento, enquanto "vl_titulo" e o
+    valor DESTA parcela. Exemplo real (titulo 2969/1): vl_original=9428,00 e
+    vl_titulo=530,00. Como o Web tem uma linha por parcela, gravar vl_original
+    multiplicava o contas a receber pelo numero de parcelas.
+
+    "vl_juros_venda" nao entra na conta: nenhuma procedure do GIV o soma ao
+    valor do titulo (e ele e zero em toda a base).
+    """
+    vl_titulo = valor_decimal_ou_zero(titulo.get('vl_titulo'))
     vl_desconto = valor_decimal_ou_zero(titulo.get('vl_desconto'))
-    vl_acrescimo = (
-        valor_decimal_ou_zero(titulo.get('vl_acrescimo'))
-        + valor_decimal_ou_zero(titulo.get('vl_juros_venda'))
-    )
-    vl_liquido = vl_original - vl_desconto + vl_acrescimo
+    vl_acrescimo = valor_decimal_ou_zero(titulo.get('vl_acrescimo'))
+    vl_liquido = vl_titulo - vl_desconto + vl_acrescimo
+    # vl_pago vai como esta no GIV; os relatorios de la nao presumem baixa.
     vl_pago = valor_decimal_ou_zero(titulo.get('vl_pago'))
 
-    status = (limpar_valor(titulo.get('id_situacao')) or '').upper()
-    if vl_pago == 0 and status in ('BA', 'B'):
-        vl_pago = valor_decimal_ou_zero(titulo.get('vl_titulo')) or vl_liquido
-
     return {
-        'vl_original': vl_original,
+        'vl_titulo': vl_titulo,
         'vl_desconto': vl_desconto,
         'vl_acrescimo': vl_acrescimo,
         'vl_liquido': vl_liquido,
@@ -9906,7 +9913,7 @@ def processar_titulo_receber_rotina(cursor_giv, cursor_web, tabelas_web, mapas, 
             'dt_emissao': valor_data_ou_agora(titulo.get('dt_emissao')),
             'dt_vencto': valor_data_ou_agora(titulo.get('dt_vencto')),
             'dt_pagto': titulo.get('dt_pagto'),
-            'vl_titulo': valores_titulo['vl_original'],
+            'vl_titulo': valores_titulo['vl_titulo'],
             'vl_acrescimo': valores_titulo['vl_acrescimo'],
             'vl_desconto': valores_titulo['vl_desconto'],
             'vl_pago': valores_titulo['vl_pago'],
@@ -11553,29 +11560,28 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
             tabelas_web.get('titulo_receber'),
             [
                 ('qtd', 'count'),
-                ('vl_titulo_original', 'decimal'),
+                ('vl_titulo', 'decimal'),
                 ('vl_desconto', 'decimal'),
                 ('vl_acrescimo', 'decimal'),
                 ('vl_liquido', 'decimal'),
                 ('vl_pago', 'decimal'),
+                ('vl_saldo_aberto', 'decimal'),
             ],
+            # Mesma composicao das procedures do GIV (pr_rel_balanco_patrimonial):
+            # saldo = vl_titulo - vl_desconto + vl_acrescimo - vl_pago.
+            # vl_original NAO entra: e o total da venda repetido em cada parcela.
             f"""
             SELECT
                 COUNT(*),
-                COALESCE(SUM(CASE WHEN COALESCE(vl_original, 0) = 0 THEN COALESCE(vl_titulo, 0) ELSE COALESCE(vl_original, 0) END), 0),
+                COALESCE(SUM(vl_titulo), 0),
                 COALESCE(SUM(vl_desconto), 0),
-                COALESCE(SUM(COALESCE(vl_acrescimo, 0) + COALESCE(vl_juros_venda, 0)), 0),
+                COALESCE(SUM(vl_acrescimo), 0),
+                COALESCE(SUM(vl_titulo - vl_desconto + vl_acrescimo), 0),
+                COALESCE(SUM(vl_pago), 0),
                 COALESCE(SUM(
-                    (CASE WHEN COALESCE(vl_original, 0) = 0 THEN COALESCE(vl_titulo, 0) ELSE COALESCE(vl_original, 0) END)
-                    - COALESCE(vl_desconto, 0)
-                    + COALESCE(vl_acrescimo, 0)
-                    + COALESCE(vl_juros_venda, 0)
-                ), 0),
-                COALESCE(SUM(
-                    CASE
-                        WHEN COALESCE(vl_pago, 0) = 0 AND id_situacao IN ('BA', 'B') THEN COALESCE(vl_titulo, 0)
-                        ELSE COALESCE(vl_pago, 0)
-                    END
+                    CASE WHEN id_situacao = 'AB'
+                         THEN vl_titulo - vl_desconto + vl_acrescimo - vl_pago
+                         ELSE 0 END
                 ), 0)
               FROM titulo_receber
              WHERE cd_empresa = {cd_empresa_giv}
@@ -11587,7 +11593,12 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
                 COALESCE(SUM(vl_desconto), 0),
                 COALESCE(SUM(vl_acrescimo), 0),
                 COALESCE(SUM(vl_titulo - vl_desconto + vl_acrescimo), 0),
-                COALESCE(SUM(vl_pago), 0)
+                COALESCE(SUM(vl_pago), 0),
+                COALESCE(SUM(
+                    CASE WHEN id_status = 'A'
+                         THEN vl_titulo - vl_desconto + vl_acrescimo - vl_pago
+                         ELSE 0 END
+                ), 0)
               FROM {tabelas_web.get('titulo_receber')}
              WHERE tenant_id = %s AND cd_empresa = %s
             """,
@@ -11600,14 +11611,21 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
             'titulo_pagar',
             'titulo_pagar',
             tabelas_web.get('titulo_pagar'),
-            [('qtd', 'count'), ('vl_titulo', 'decimal'), ('vl_desconto', 'decimal'), ('vl_acrescimo', 'decimal'), ('vl_pago', 'decimal')],
+            [('qtd', 'count'), ('vl_titulo', 'decimal'), ('vl_desconto', 'decimal'),
+             ('vl_acrescimo', 'decimal'), ('vl_pago', 'decimal'), ('vl_saldo_aberto', 'decimal')],
+            # saldo em aberto pela mesma conta do GIV (pr_rel_fluxo_caixa_novo).
             f"""
             SELECT
                 COUNT(*),
                 COALESCE(SUM(vl_titulo), 0),
                 COALESCE(SUM(vl_desconto), 0),
                 COALESCE(SUM(vl_acrescimo), 0),
-                COALESCE(SUM(vl_pago), 0)
+                COALESCE(SUM(vl_pago), 0),
+                COALESCE(SUM(
+                    CASE WHEN id_situacao = 'AB'
+                         THEN vl_titulo - vl_desconto + vl_acrescimo - vl_pago
+                         ELSE 0 END
+                ), 0)
               FROM titulo_pagar
              WHERE cd_empresa = {cd_empresa_giv}
             """,
@@ -11617,7 +11635,12 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
                 COALESCE(SUM(vl_titulo), 0),
                 COALESCE(SUM(vl_desconto), 0),
                 COALESCE(SUM(vl_acrescimo), 0),
-                COALESCE(SUM(vl_pago), 0)
+                COALESCE(SUM(vl_pago), 0),
+                COALESCE(SUM(
+                    CASE WHEN id_status = 'A'
+                         THEN vl_titulo - vl_desconto + vl_acrescimo - vl_pago
+                         ELSE 0 END
+                ), 0)
               FROM {tabelas_web.get('titulo_pagar')}
              WHERE tenant_id = %s AND cd_empresa = %s
             """,
