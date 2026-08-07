@@ -15,6 +15,7 @@ import os
 import re
 import time
 import unicodedata
+from collections import defaultdict
 from decimal import Decimal
 from urllib.parse import urlparse, unquote
 
@@ -3642,6 +3643,19 @@ def carregar_mapas_auxiliares_produto(cursor_giv, cursor_web, tabelas_web, tenan
     """Carrega de/para dos auxiliares de produto que ja existem no Web."""
     mapas = {}
 
+    if tabelas_web.get('cor'):
+        mapas['cor'] = buscar_mapa_giv_para_web_por_nome(
+            cursor_giv,
+            cursor_web,
+            sql_mapa_giv_auxiliar(cursor_giv, 'cor', 'cd_cor', 'ds_cor', cd_empresa_giv),
+            'cd_cor',
+            'ds_cor',
+            tabelas_web['cor'],
+            'cd_cor',
+            'ds_cor',
+            tenant_id=tenant_id
+        )
+
     if tabelas_web.get('tamanho'):
         mapas['tamanho'] = buscar_mapa_giv_para_web_por_nome(
             cursor_giv,
@@ -5920,6 +5934,31 @@ def montar_precos_web(precos_giv, cd_produto_web, tenant_id):
     ]
 
 
+def carregar_variacoes_por_pai_web(cursor_web, tabela_web_produto_filho, tenant_id):
+    """
+    Carrega as combinacoes (cd_produto_pai, cd_cor, cd_tamanho) que ja existem
+    no Web para o tenant. A unique ux_produto_filho_familia_variacao impede que
+    uma familia tenha duas variacoes com a mesma cor e tamanho, entao precisamos
+    conhecer o que ja existe antes de montar os filhos.
+    """
+    variacoes = set()
+    if not tabela_web_produto_filho:
+        return variacoes
+    cursor_web.execute(
+        f"""
+        SELECT {quote_identificador('cd_produto_pai')},
+               {quote_identificador('cd_cor')},
+               {quote_identificador('cd_tamanho')}
+          FROM {tabela_web_produto_filho}
+         WHERE {quote_identificador('tenant_id')} = %s
+        """,
+        (tenant_id,)
+    )
+    for row in cursor_web.fetchall():
+        variacoes.add((row[0], row[1], row[2]))
+    return variacoes
+
+
 def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, produtos_giv, barcodes_giv, mapas, classificacao):
     """Relaciona produtos GIV com produtos ja existentes no Web dentro do mesmo tenant."""
     cursor_web.execute(
@@ -6577,6 +6616,15 @@ def processar_produtos(
 
     print()
     print(f"[...] Montando/inserindo {len(filhos)} produtos filhos em rodadas...")
+    variacoes_por_pai_web = carregar_variacoes_por_pai_web(
+        cursor_web, tabelas_web.get('produto_filho'), tenant_id
+    )
+    if variacoes_por_pai_web:
+        print(
+            f"[OK] {len(variacoes_por_pai_web)} variacoes (pai+cor+tamanho) ja existentes "
+            "no Web carregadas para nao colidir com a unique da familia."
+        )
+    variacoes_duplicadas = 0
     pendentes_filhos = list(filhos)
     inseridos_filhos = 0
     rodada_filhos = 1
@@ -6622,6 +6670,27 @@ def processar_produtos(
                 elif erros == 11:
                     print("  ... suprimindo demais erros de validacao de filho")
                 continue
+
+            # ux_produto_filho_familia_variacao: (tenant_id, cd_produto_pai,
+            # cd_cor, cd_tamanho) e unico. O GIV repete variacoes dentro da mesma
+            # familia; isso e duplicidade da origem, nao falha de conversao.
+            variacao = (
+                produto_filho.get('cd_produto_pai'),
+                produto_filho.get('cd_cor'),
+                produto_filho.get('cd_tamanho'),
+            )
+            if variacao in variacoes_por_pai_web:
+                variacoes_duplicadas += 1
+                if variacoes_duplicadas <= 5:
+                    print(
+                        f"  [PULO] produto filho cd_produto_giv={cd_produto_giv}: variacao "
+                        f"pai={variacao[0]} cor={variacao[1]} tamanho={variacao[2]} ja existe "
+                        "nessa familia."
+                    )
+                elif variacoes_duplicadas == 6:
+                    print("  ... suprimindo demais avisos de variacao duplicada")
+                continue
+            variacoes_por_pai_web.add(variacao)
 
             itens_filhos.append({
                 'cd_produto_giv': cd_produto_giv,
@@ -6745,6 +6814,11 @@ def processar_produtos(
         pendentes_filhos = proximos_pendentes
         rodada_filhos += 1
 
+    if variacoes_duplicadas:
+        print(
+            f"[OK] Produto filho: {variacoes_duplicadas} variacoes duplicadas no GIV "
+            "(mesmo pai + cor + tamanho) foram ignoradas; nao sao erro de conversao."
+        )
     print(
         f"[OK] Produtos filhos/pendentes: {inseridos_filhos} inseridos "
         f"em {int(time.monotonic() - inicio_filhos)}s.",
@@ -6978,6 +7052,35 @@ def buscar_codigo_minimo_web(cursor_web, tabela_web, coluna, tenant_id=None, cd_
     return row[0] if row else None
 
 
+def buscar_cliente_padrao_web(cursor_web, tabela_web_cliente, tenant_id, cd_empresa):
+    """Busca o cadastro CONSUMIDOR usado para NFs sem cliente cadastrado."""
+    cursor_web.execute(
+        f"""
+        SELECT {quote_identificador('cd_cliente')}, {quote_identificador('nm_cliente')}
+          FROM {tabela_web_cliente}
+         WHERE {quote_identificador('tenant_id')} = %s
+           AND {quote_identificador('cd_empresa')} = %s
+           AND UPPER(TRIM({quote_identificador('nm_cliente')})) LIKE 'CONSUMIDOR%'
+         ORDER BY {quote_identificador('cd_cliente')}
+         LIMIT 1
+        """,
+        (tenant_id, cd_empresa)
+    )
+    row = cursor_web.fetchone()
+    if row:
+        print(
+            f"[OK] Cliente padrao para NFs sem cadastro: "
+            f"cd_cliente={row[0]} ({limpar_valor(row[1])})."
+        )
+        return row[0]
+
+    print(
+        f"[AVISO] Nenhum cliente CONSUMIDOR encontrado no tenant={tenant_id}, "
+        f"empresa={cd_empresa}; NFs sem de/para continuarao sendo reportadas."
+    )
+    return None
+
+
 def carregar_mapa_usuario_rotinas(cursor_giv, cursor_web, tabela_web_usuario, tenant_id, cd_empresa, cd_empresa_giv=None):
     where_sql = ""
     params = []
@@ -7123,9 +7226,20 @@ def carregar_mapa_cliente_rotinas(cursor_giv, cursor_web, tabela_web_cliente, te
     return mapa
 
 
-def carregar_mapa_produto_rotinas(cursor_giv, cursor_web, tabelas_web_produto, tenant_id):
+def carregar_mapa_produto_rotinas(
+    cursor_giv,
+    cursor_web,
+    tabelas_web_produto,
+    tenant_id,
+    mapas_auxiliares=None
+):
     produtos_giv = buscar_produtos_giv(cursor_giv)
     barcodes_giv = buscar_barcodes_produto_giv(cursor_giv)
+    mapas_auxiliares = mapas_auxiliares or {}
+    produtos_por_codigo = {
+        produto.get('cd_produto'): produto
+        for produto in produtos_giv
+    }
     cursor_web.execute(
         f"""
         SELECT
@@ -7215,15 +7329,126 @@ def carregar_mapa_produto_rotinas(cursor_giv, cursor_web, tabelas_web_produto, t
             mapa[cd_origem] = cd_web
             mapa[normalizar_codigo_cidade(cd_origem)] = cd_web
 
+    # Variacoes podem ter o mesmo nome/referencia no Web. Nesses casos, o
+    # de/para correto e a chave funcional da variacao: pai + cor + tamanho.
+    # Isso reaproveita a variacao que ja existe e evita criar produto duplicado
+    # durante uma retomada de documentos.
+    variacoes_por_pai = defaultdict(list)
+    pais_web = set()
+    tabela_web_filho = tabelas_web_produto.get('produto_filho')
+    if tabela_web_filho:
+        cursor_web.execute(
+            f"""
+            SELECT
+                {quote_identificador('cd_produto_filho')},
+                {quote_identificador('cd_produto_pai')},
+                {quote_identificador('cd_cor')},
+                {quote_identificador('cd_tamanho')}
+              FROM {tabela_web_filho}
+             WHERE {quote_identificador('tenant_id')} = %s
+            """,
+            (tenant_id,)
+        )
+        for cd_filho, cd_pai, cd_cor, cd_tamanho in cursor_web.fetchall():
+            variacoes_por_pai[(cd_pai, cd_cor, cd_tamanho)].append(cd_filho)
+            pais_web.add(cd_pai)
+
+    def codigo_mapeado(mapa_auxiliar, valor):
+        if valor is None:
+            return None
+        return mapa_auxiliar.get(valor) or mapa_auxiliar.get(normalizar_codigo_cidade(valor))
+
+    def candidatos_produto_web(produto):
+        """Retorna candidatos existentes para o produto por seus dados estaveis."""
+        barcode = somente_digitos(barcodes_giv.get(produto.get('cd_produto')))
+        referencia = chave_texto(produto.get('cd_referencia'))
+        nome = chave_texto(produto.get('ds_produto'))
+        candidatos = set()
+        if barcode:
+            candidatos.update(por_barcode.get(barcode, set()))
+        if referencia and nome:
+            candidatos.update(por_referencia_nome.get((referencia, nome), set()))
+        if referencia:
+            candidatos.update(por_referencia.get(referencia, set()))
+        if nome:
+            candidatos.update(por_nome.get(nome, set()))
+        return candidatos
+
+    mapa_cor = mapas_auxiliares.get('cor', {})
+    mapa_tamanho = mapas_auxiliares.get('tamanho', {})
+    pais_reaproveitados = 0
+    por_variacao_ok = 0
+    pais_giv_necessarios = {
+        produto.get('cd_produto_pai')
+        for produto in produtos_giv
+        if produto.get('cd_produto_pai') not in (None, 0)
+        and mapa.get(produto.get('cd_produto_pai')) is None
+    }
+
+    # Quando ja existem varias familias iguais no Web, escolhemos a familia
+    # de maior codigo para que os filhos possam ser ligados sem recadastrar o
+    # mesmo pai. A escolha e feita apenas para pais realmente usados por
+    # variacoes, nao para todo cadastro ambiguo.
+    for produto in produtos_giv:
+        cd_origem = produto.get('cd_produto')
+        if cd_origem not in pais_giv_necessarios or mapa.get(cd_origem) is not None:
+            continue
+        candidatos_pai = candidatos_produto_web(produto).intersection(pais_web)
+        if candidatos_pai:
+            cd_web = max(candidatos_pai)
+            mapa[cd_origem] = cd_web
+            mapa[normalizar_codigo_cidade(cd_origem)] = cd_web
+            pais_reaproveitados += 1
+
+    for produto in produtos_giv:
+        cd_origem = produto.get('cd_produto')
+        if mapa.get(cd_origem) is not None:
+            continue
+        cd_pai_web = codigo_mapeado(mapa, produto.get('cd_produto_pai'))
+        candidatos_pai = set()
+        if cd_pai_web is not None:
+            candidatos_pai.add(cd_pai_web)
+        pai_giv = produto.get('cd_produto_pai')
+        if pai_giv is not None:
+            pai_origem = produtos_por_codigo.get(pai_giv)
+            if pai_origem:
+                candidatos_pai.update(
+                    candidatos_produto_web(pai_origem).intersection(pais_web)
+                )
+        cd_cor_web = codigo_mapeado(mapa_cor, produto.get('cd_cor'))
+        cd_tamanho_web = codigo_mapeado(mapa_tamanho, produto.get('cd_tamanho'))
+        candidatos_variacao = set()
+        for pai_web in candidatos_pai:
+            candidatos_variacao.update(
+                variacoes_por_pai.get((pai_web, cd_cor_web, cd_tamanho_web), [])
+            )
+        if candidatos_variacao:
+            # Familias duplicadas no Web representam o mesmo item funcional;
+            # reutilizamos uma delas, mantendo a unique pai+cor+tamanho.
+            cd_web = max(candidatos_variacao)
+            mapa[cd_origem] = cd_web
+            mapa[normalizar_codigo_cidade(cd_origem)] = cd_web
+            por_variacao_ok += 1
+
+    ambiguos_finais = sum(
+        1 for produto in produtos_giv if mapa.get(produto.get('cd_produto')) is None
+    )
     print(
         f"[OK] Mapa produto rotinas: {len(mapa)} produtos "
-        f"({por_barcode_ok} por barcode, {por_referencia_ok} por referencia, {por_nome_ok} por nome); "
-        f"{ambiguos} produtos ambiguos ficaram sem mapa."
+        f"({por_barcode_ok} por barcode, {por_referencia_ok} por referencia, "
+        f"{por_nome_ok} por nome, {por_variacao_ok} por pai+cor+tamanho, "
+        f"{pais_reaproveitados} pais reaproveitados); "
+        f"{ambiguos_finais} produtos ficaram sem mapa."
     )
     return mapa
 
 
-def coletar_codigos_produto_rotinas(cursor_giv, tabelas_selecionadas, cd_empresa_giv=None):
+def coletar_codigos_produto_rotinas(
+    cursor_giv,
+    tabelas_selecionadas,
+    cd_empresa_giv=None,
+    mapa_nf_saida=None
+):
     """Coleta os produtos usados nas rotinas/documentos selecionados."""
     origens = {
         'condicional': 'orcamento_item',
@@ -7237,6 +7462,29 @@ def coletar_codigos_produto_rotinas(cursor_giv, tabelas_selecionadas, cd_empresa
         if chave not in tabelas_selecionadas:
             continue
         try:
+            if chave == 'nota_fiscal_saida' and mapa_nf_saida is not None:
+                # Em uma retomada, nao precisamos recadastrar produtos usados
+                # pelas NFs que ja existem no Web. Isso evita duplicar produtos
+                # auxiliares cadastrados na primeira execucao parcial.
+                registros_itens = buscar_registros_giv_tabela(
+                    cursor_giv,
+                    tabela,
+                    'cd_empresa, nr_nota, serie, cd_produto',
+                    cd_empresa_giv=cd_empresa_giv
+                )
+                for reg in registros_itens:
+                    chave_nf = (
+                        reg.get('cd_empresa'),
+                        reg.get('nr_nota'),
+                        serie_doc(reg.get('serie')),
+                    )
+                    if chave_nf in mapa_nf_saida:
+                        continue
+                    cd_produto = reg.get('cd_produto')
+                    if cd_produto is not None:
+                        codigos.add(normalizar_codigo_cidade(cd_produto) or cd_produto)
+                continue
+
             where_empresa = ""
             if cd_empresa_giv is not None and tabela_giv_tem_coluna(cursor_giv, tabela, 'cd_empresa'):
                 where_empresa = f" AND cd_empresa = {int(cd_empresa_giv)}"
@@ -7280,10 +7528,16 @@ def cadastrar_produtos_faltantes_rotinas(
     cd_empresa,
     mapa_produtos,
     cd_empresa_giv=None,
-    mapas_convertidos=None
+    mapas_convertidos=None,
+    mapa_nf_saida=None
 ):
     """Cadastra somente produtos usados nos documentos que ainda nao existem no Web."""
-    codigos_usados = coletar_codigos_produto_rotinas(cursor_giv, tabelas_selecionadas, cd_empresa_giv)
+    codigos_usados = coletar_codigos_produto_rotinas(
+        cursor_giv,
+        tabelas_selecionadas,
+        cd_empresa_giv,
+        mapa_nf_saida
+    )
     if not codigos_usados:
         return {
             'tabela': 'produto_faltante_documento',
@@ -7480,6 +7734,10 @@ def cadastrar_produtos_faltantes_rotinas(
 
     itens_filhos = []
     filhos_sem_pai = []
+    variacoes_por_pai_web = carregar_variacoes_por_pai_web(
+        cursor_web, tabelas_web_produto.get('produto_filho'), tenant_id
+    )
+    variacoes_duplicadas = 0
     for reg in filhos:
         cd_produto_giv = reg.get('cd_produto')
         cd_pai_giv = reg.get('cd_produto_pai')
@@ -7504,6 +7762,19 @@ def cadastrar_produtos_faltantes_rotinas(
             elif erros == 11:
                 print("  ... suprimindo demais erros de produto filho faltante")
             continue
+
+        # Mesma regra da conversao completa: ux_produto_filho_familia_variacao
+        # impede duas variacoes com o mesmo pai + cor + tamanho.
+        variacao = (
+            produto_filho.get('cd_produto_pai'),
+            produto_filho.get('cd_cor'),
+            produto_filho.get('cd_tamanho'),
+        )
+        if variacao in variacoes_por_pai_web:
+            variacoes_duplicadas += 1
+            continue
+        variacoes_por_pai_web.add(variacao)
+
         itens_filhos.append({
             'cd_produto_giv': cd_produto_giv,
             'cd_produto_web': cd_produto_web,
@@ -7543,6 +7814,12 @@ def cadastrar_produtos_faltantes_rotinas(
         for item in itens_filhos_sucesso:
             mapa_produtos[item['cd_produto_giv']] = item['cd_produto_web']
             mapa_produtos[normalizar_codigo_cidade(item['cd_produto_giv'])] = item['cd_produto_web']
+
+    if variacoes_duplicadas:
+        print(
+            f"[OK] Produto faltante: {variacoes_duplicadas} variacoes duplicadas no GIV "
+            "(mesmo pai + cor + tamanho) foram ignoradas."
+        )
 
     print(
         f"[OK] Produtos faltantes para documentos: {inseridos} cadastrados, "
@@ -8794,6 +9071,10 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
 
     itens = []
     erros_itens = []
+    # A PK do Web e (tenant_id, nf_id, nr_item), mas o GIV pode repetir
+    # nr_item dentro da mesma nota. O Web usa a posicao valida do item e
+    # preserva o numero original em nr_item_xml_origem.
+    ordinal = {}
     for item in itens_giv:
         chave = (item.get('cd_empresa'), item.get('nr_nota'), serie_doc(item.get('serie')), item.get('cd_fornecedor'))
         nf_id = mapa_nf.get(chave)
@@ -8809,8 +9090,10 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
         if motivos:
             registrar_erro_validacao(erros_itens, 'nota_fiscal_entrada_item', f"nf={item.get('nr_nota')} item={item.get('nr_item')}", '; '.join(motivos))
             continue
+        ordinal[nf_id] = ordinal.get(nf_id, 0) + 1
         itens.append(limpar_registro({
-            'nr_item': item.get('nr_item') or 1,
+            'nr_item': ordinal[nf_id],
+            'nr_item_xml_origem': item.get('nr_item'),
             'nf_id': nf_id,
             'tenant_id': tenant_id,
             'cd_produto': cd_produto,
@@ -9287,17 +9570,48 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
     max_nf = sincronizar_sequence_com_max(cursor_web, tabelas_web['nota_fiscal_saida'], 'nf_id', sequence_nf)
     print(f"[OK] Sequence nota_fiscal_saida: {sequence_nf} (sincronizada com max={max_nf}).")
 
-    codigos = iter(reservar_valores_sequence(cursor_web, sequence_nf, len(notas_giv)))
+    # A rotina pode ser executada novamente depois de uma conversao parcial.
+    # Reaproveitamos a NF Web pela chave de origem (empresa, numero e serie)
+    # e reservamos sequence somente para as notas que ainda nao existem.
+    mapa_nf_existente = dict(mapas.get('nf_saida') or {})
+    mapa_nf = dict(mapa_nf_existente)
+    notas_novas = []
+    chaves_novas = set()
+    for nota in notas_giv:
+        chave = (nota.get('cd_empresa'), nota.get('nr_nota'), serie_doc(nota.get('serie')))
+        if chave in mapa_nf_existente or chave in chaves_novas:
+            continue
+        chaves_novas.add(chave)
+        notas_novas.append((chave, nota))
+
+    if mapa_nf_existente:
+        print(
+            f"[OK] {len(notas_giv) - len(notas_novas)} notas de saida ja existem no Web; "
+            f"{len(notas_novas)} serao novas nesta execucao."
+        )
+
+    codigos = iter(
+        reservar_valores_sequence(cursor_web, sequence_nf, len(notas_novas))
+        if notas_novas
+        else []
+    )
     registros = []
     infos = []
-    mapa_nf = {}
     erros_detalhe = []
+    nf_ids_novos = set()
+    clientes_padrao = 0
     empresa = mapas.get('empresa') or {}
-    for nota in notas_giv:
+    cliente_padrao = mapas.get('cliente_padrao')
+    for chave, nota in notas_novas:
         nf_id = next(codigos)
-        chave = (nota.get('cd_empresa'), nota.get('nr_nota'), serie_doc(nota.get('serie')))
         motivos = []
         cd_cliente = mapas['cliente'].get((nota.get('cd_empresa_cliente'), nota.get('cd_cliente'))) or mapas['cliente'].get(nota.get('cd_cliente'))
+        if cd_cliente is None and cliente_padrao is not None:
+            # Ha NFs antigas com cd_empresa_cliente=1 e outras com 0, mas os
+            # codigos apontados nao existem mais na tabela cliente do GIV.
+            # Preservamos a NF e seus itens usando o consumidor padrao.
+            cd_cliente = cliente_padrao
+            clientes_padrao += 1
         cd_cfop = nota.get('cd_natureza')
         if cd_cliente is None:
             motivos.append(f"cliente GIV {nota.get('cd_cliente')} sem de/para")
@@ -9307,6 +9621,7 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
             registrar_erro_validacao(erros_detalhe, 'nota_fiscal_saida', f"nr_nota={nota.get('nr_nota')} serie={nota.get('serie')}", '; '.join(motivos))
             continue
         mapa_nf[chave] = nf_id
+        nf_ids_novos.add(nf_id)
         vl_acrescimo = valor_decimal_ou_zero(nota.get('vl_acrescimo'))
         vl_acrescimo_item = valor_decimal_ou_zero(nota.get('vl_acrescimo_total_item'))
         registros.append(limpar_registro({
@@ -9375,6 +9690,13 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
         else:
             registrar_erro_validacao(erros_detalhe, 'nota_fiscal_saida_info', f"nf_id={nf_id}", 'sem usuario/forma/condicao padrao para info')
 
+    if clientes_padrao:
+        print(
+            f"[AVISO] {clientes_padrao} notas de saida usarao o cliente padrao "
+            f"cd_cliente={cliente_padrao}: o GIV informou consumidor sem cadastro "
+            "(cd_empresa_cliente=0)."
+        )
+
     aplicar_limites_texto_web(cursor_web, tabelas_web['nota_fiscal_saida'], registros, 'nota_fiscal_saida')
     inseridos, erros_insert, erros_insert_detalhe = inserir_registros_web(
         cursor_web,
@@ -9399,10 +9721,14 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
     erros_itens = []
     ordinal = {}
     status_nf = {reg['nf_id']: reg['id_status'] for reg in registros}
+    itens_existentes = 0
     for item in itens_giv:
         chave = (item.get('cd_empresa'), item.get('nr_nota'), serie_doc(item.get('serie')))
         nf_id = mapa_nf.get(chave)
         if nf_id is None:
+            continue
+        if nf_id not in nf_ids_novos:
+            itens_existentes += 1
             continue
         cd_cfop = item.get('cd_natureza')
         cd_produto = mapas['produto'].get(item.get('cd_produto'))
@@ -9477,9 +9803,30 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
     erros_itens.extend(erros_insert_itens_detalhe)
 
     return mapa_nf, [
-        {'tabela': 'nota_fiscal_saida', 'lidos': len(notas_giv), 'inseridos': inseridos, 'existentes': 0, 'erros': len(erros_detalhe), 'erros_detalhe': erros_detalhe},
-        {'tabela': 'nota_fiscal_saida_info', 'lidos': len(registros), 'inseridos': inseridos_info, 'existentes': 0, 'erros': erros_info, 'erros_detalhe': erros_info_detalhe},
-        {'tabela': 'nota_fiscal_saida_item', 'lidos': len(itens_giv), 'inseridos': inseridos_itens, 'existentes': 0, 'erros': len(erros_itens), 'erros_detalhe': erros_itens},
+        {
+            'tabela': 'nota_fiscal_saida',
+            'lidos': len(notas_giv),
+            'inseridos': inseridos,
+            'existentes': len(notas_giv) - len(notas_novas),
+            'erros': len(erros_detalhe),
+            'erros_detalhe': erros_detalhe,
+        },
+        {
+            'tabela': 'nota_fiscal_saida_info',
+            'lidos': len(notas_giv),
+            'inseridos': inseridos_info,
+            'existentes': len(notas_giv) - len(notas_novas),
+            'erros': erros_info,
+            'erros_detalhe': erros_info_detalhe,
+        },
+        {
+            'tabela': 'nota_fiscal_saida_item',
+            'lidos': len(itens_giv),
+            'inseridos': inseridos_itens,
+            'existentes': itens_existentes,
+            'erros': len(erros_itens),
+            'erros_detalhe': erros_itens,
+        },
     ]
 
 
@@ -9657,7 +10004,13 @@ def carregar_mapa_banco_conta(cursor_web, tabela_web_banco_conta, tenant_id, cd_
     return mapa
 
 
-def carregar_mapa_nf_saida_existente(cursor_web, tabela_web_nf_saida, tenant_id, cd_empresa):
+def carregar_mapa_nf_saida_existente(
+    cursor_web,
+    tabela_web_nf_saida,
+    tenant_id,
+    cd_empresa,
+    cd_empresa_giv=None
+):
     cursor_web.execute(
         f"""
         SELECT nf_id, nr_nota, serie
@@ -9667,8 +10020,9 @@ def carregar_mapa_nf_saida_existente(cursor_web, tabela_web_nf_saida, tenant_id,
         """,
         (tenant_id, cd_empresa)
     )
+    empresa_origem = cd_empresa_giv if cd_empresa_giv is not None else cd_empresa
     return {
-        (cd_empresa, nr_nota, serie_doc(serie)): nf_id
+        (empresa_origem, nr_nota, serie_doc(serie)): nf_id
         for nf_id, nr_nota, serie in cursor_web.fetchall()
     }
 
@@ -13024,6 +13378,29 @@ def main():
             if mapa_usuarios:
                 mapa_usuario_rotinas.update(mapa_usuarios)
 
+            mapa_cliente_rotinas = carregar_mapa_cliente_rotinas(
+                cursor_giv,
+                cursor_web,
+                tabela_web_cliente,
+                tenant_id,
+                cd_empresa,
+                cd_empresa_giv_filtro
+            )
+            cliente_padrao_rotinas = buscar_cliente_padrao_web(
+                cursor_web,
+                tabela_web_cliente,
+                tenant_id,
+                cd_empresa
+            )
+            mapas_aux_rotinas = carregar_mapas_auxiliares_produto(
+                cursor_giv,
+                cursor_web,
+                tabelas_web_produto,
+                tenant_id,
+                cd_empresa,
+                cd_empresa_giv_filtro
+            )
+
             mapas_rotinas = {
                 'fornecedor': buscar_mapa_fornecedor_produto(
                     cursor_giv,
@@ -13032,14 +13409,8 @@ def main():
                     tenant_id,
                     cd_empresa_giv_filtro
                 ),
-                'cliente': carregar_mapa_cliente_rotinas(
-                    cursor_giv,
-                    cursor_web,
-                    tabela_web_cliente,
-                    tenant_id,
-                    cd_empresa,
-                    cd_empresa_giv_filtro
-                ),
+                'cliente': mapa_cliente_rotinas,
+                'cliente_padrao': cliente_padrao_rotinas,
                 'usuario': mapa_usuario_rotinas,
                 'usuario_padrao': usuario_padrao,
                 'condicao_pagamento': mapa_condicoes,
@@ -13053,7 +13424,8 @@ def main():
                     cursor_giv,
                     cursor_web,
                     tabelas_web_produto,
-                    tenant_id
+                    tenant_id,
+                    mapas_aux_rotinas
                 ),
                 'cfop': carregar_mapa_cfop(cursor_web, tabelas_web_rotinas['cfop']),
                 'empresa': carregar_dados_empresa(
@@ -13068,7 +13440,8 @@ def main():
                 cursor_web,
                 tabelas_web_rotinas['nota_fiscal_saida'],
                 tenant_id,
-                cd_empresa
+                cd_empresa,
+                cd_empresa_giv_filtro
             )
             mapas_rotinas['nf_entrada'] = carregar_mapa_nf_entrada_existente(
                 cursor_web,
@@ -13109,14 +13482,6 @@ def main():
                     cd_empresa,
                     cd_empresa_giv_filtro
                 )
-            mapas_aux_rotinas = carregar_mapas_auxiliares_produto(
-                cursor_giv,
-                cursor_web,
-                tabelas_web_produto,
-                tenant_id,
-                cd_empresa,
-                cd_empresa_giv_filtro
-            )
             mapas_rotinas.update({
                 'unidade': mapas_aux_rotinas.get('unidade', {}),
                 'cor': mapas_aux_rotinas.get('cor', {}),
@@ -13133,7 +13498,8 @@ def main():
                     cd_empresa,
                     mapas_rotinas['produto'],
                     cd_empresa_giv_produto,
-                    mapas_auxiliares_produto
+                    mapas_auxiliares_produto,
+                    mapas_rotinas.get('nf_saida')
                 )
                 if resumo_produtos_faltantes.get('lidos') or resumo_produtos_faltantes.get('inseridos') or resumo_produtos_faltantes.get('erros'):
                     resumos.append(resumo_produtos_faltantes)
