@@ -94,7 +94,39 @@ MAPA_STATUS_PRODUTO_PADRAO = {
     'E': 'I',
     'F': 'I',
 }
-CD_TABELA_PRECO_PRODUTO_PADRAO = 1
+# ---------------------------------------------------------------------------
+# Tabela de preco padrao
+#
+# Regra oficial do sistema Web (projeto_v1), confirmada em:
+#   src/adapters/outbound/repositories/utils/tabelaPrecoPadrao.ts
+#   src/application/usecases/config/upsertConfigValueUseCase.ts
+#   prisma/migrations/20260715210000_tabela_preco_padrao_por_empresa/migration.sql
+#   prisma/migrations/20260716143000_add_preco_por_produto_filho/migration.sql
+#
+# 1) "tabela_preco" pertence ao TENANT (nao possui cd_empresa) e o
+#    "cd_tabela_preco" e uma sequence GLOBAL (@default(autoincrement())).
+#    Logo, nao existe garantia nenhuma de que o tenant tenha o codigo 1.
+# 2) Cada EMPRESA escolhe qual tabela do tenant e a padrao atraves de:
+#       sys_config_values(key='tabela_preco_padrao', scope_type='empresa',
+#                         tenant_id, cd_empresa) -> value = cd_tabela_preco
+#    (a chave e obrigatoriamente de escopo 'empresa'; o escopo 'tenant' foi
+#     removido pela migration 20260715210000).
+# 3) O codigo so e valido se existir em tabela_preco com o MESMO tenant_id e
+#    id_status = 'A'.
+# 4) A FK "fk_produto_preco_tabela_tenant" exige o par
+#    (tenant_id, cd_tabela_preco) presente em tabela_preco, e a unique
+#    "ux_tabela_preco_tenant_codigo" garante esse par.
+#
+# Por isso NAO existe codigo fixo seguro. O valor abaixo comeca indefinido e e
+# preenchido em tempo de execucao por resolver_tabela_preco_padrao_web().
+# ---------------------------------------------------------------------------
+# Modos de execucao segura (ver parse_argumentos_execucao()).
+MODO_DRY_RUN = False
+LIMITE_PRODUTOS_CONVERSAO = 0
+
+CONFIG_TABELA_PRECO_PADRAO = "tabela_preco_padrao"
+DS_TABELA_PRECO_PADRAO_CONVERSAO = "TABELA PADRAO"
+CD_TABELA_PRECO_PRODUTO_PADRAO = None
 CD_COLECAO_PRODUTO_PADRAO = 3
 CD_SITUACAO_TRIBUTARIA_PRODUTO_PADRAO = "000"
 DIAS_LICENCA_EMPRESA_PADRAO = 30
@@ -102,6 +134,7 @@ ADMIN_NOME_PADRAO = "Administrador"
 ADMIN_LOGIN_PADRAO = "admin"
 ADMIN_SENHA_PADRAO = "admin123"
 TAMANHO_LOTE_PRODUTO = 300
+TAMANHO_BLOCO_SEQUENCE_PRODUTO = 5000
 LOG_PRODUTO_INTERVALO_REGISTROS = 1000
 LOG_PRODUTO_INTERVALO_SEGUNDOS = 5
 AUXILIARES_PRODUTO = (
@@ -1117,6 +1150,22 @@ def reservar_valores_sequence(cursor_web, sequence_nome, quantidade):
     return [row[0] for row in cursor_web.fetchall()]
 
 
+def gerador_codigos_sequence(cursor_web, sequence_nome, total, tamanho_bloco):
+    """
+    Entrega codigos da sequence sob demanda, reservando em blocos.
+    Evita consumir centenas de milhares de valores da sequence quando a etapa
+    falha no inicio. nextval nao volta atras no rollback, entao so reservamos o
+    que realmente vamos usar. A ordem de emissao continua crescente, preservando
+    o relacionamento pai/filho montado na mesma ordem de antes.
+    """
+    restante = int(total or 0)
+    while restante > 0:
+        bloco = min(tamanho_bloco, restante)
+        for codigo in reservar_valores_sequence(cursor_web, sequence_nome, bloco):
+            yield codigo
+        restante -= bloco
+
+
 def sincronizar_sequence_produto_global(cursor_web, tabela_web_produto, tabela_web_produto_filho, sequence_nome):
     """Sincroniza a sequence global de produto com produto e produto_filho."""
     cursor_web.execute(f"SELECT COALESCE(MAX({quote_identificador('cd_produto')}), 0) FROM {tabela_web_produto}")
@@ -1804,9 +1853,68 @@ def buscar_usuarios_existentes_web(cursor_web):
         return set()
 
 
-def inserir_registros_web(cursor_web, tabela_web, registros, campo_chave, savepoint_nome):
+# Codigos SQLSTATE que indicam problema estrutural/global: repetir item a item
+# so multiplica o tempo de execucao, porque todos os registros vao falhar igual.
+SQLSTATE_ERRO_GLOBAL = {
+    '42P01',  # undefined_table
+    '42703',  # undefined_column
+    '42804',  # datatype_mismatch
+    '42883',  # undefined_function
+    '42P10',  # invalid_column_reference
+    '3F000',  # invalid_schema_name
+    '42601',  # syntax_error
+}
+# FKs de configuracao: quando a chave que falta e a mesma para o lote inteiro
+# (tabela de preco, tenant, empresa), o erro tambem e global.
+FK_CONFIGURACAO_GLOBAL = {
+    'fk_produto_preco_tabela_tenant',
+    'fk_produto_preco_tenant',
+    'fk_produto_tenant',
+    'fk_empresa_tenant',
+    'fk_tabela_preco_tenant',
+}
+
+
+def _detalhe_erro_pg(erro):
+    """Extrai (sqlstate, nome_constraint) de um erro do psycopg, quando disponivel."""
+    diag = getattr(erro, 'diag', None)
+    sqlstate = getattr(diag, 'sqlstate', None) or getattr(erro, 'pgcode', None)
+    constraint = getattr(diag, 'constraint_name', None)
+    if sqlstate is None or constraint is None:
+        texto = str(erro)
+        if sqlstate is None:
+            match = re.search(r"'C':\s*'([0-9A-Z]{5})'", texto)
+            sqlstate = match.group(1) if match else None
+        if constraint is None:
+            match = re.search(r"'n':\s*'([^']+)'", texto)
+            constraint = match.group(1) if match else None
+    return sqlstate, constraint
+
+
+def erro_e_global(erro):
+    """
+    Diz se o erro tem causa unica para o lote inteiro. Nesse caso o fallback
+    item a item e inutil e a etapa deve ser interrompida com a causa raiz.
+    """
+    sqlstate, constraint = _detalhe_erro_pg(erro)
+    if sqlstate in SQLSTATE_ERRO_GLOBAL:
+        return True, f"SQLSTATE {sqlstate}"
+    if constraint and constraint in FK_CONFIGURACAO_GLOBAL:
+        return True, f"chave estrangeira de configuracao {constraint}"
+    return False, None
+
+
+def inserir_registros_web(
+    cursor_web,
+    tabela_web,
+    registros,
+    campo_chave,
+    savepoint_nome,
+    ignorar_conflito=False
+):
     """
     Insere registros no PostgreSQL em lotes, com fallback por registro se um lote falhar.
+    Erros de causa global interrompem a etapa em vez de repetir item a item.
     """
     if not registros:
         return 0, 0, []
@@ -1823,7 +1931,9 @@ def inserir_registros_web(cursor_web, tabela_web, registros, campo_chave, savepo
         fim_lote = inicio_lote + len(lote)
         try:
             cursor_web.execute(f"SAVEPOINT {savepoint_nome}_lote")
-            inserir_registros_multi_sem_savepoint(cursor_web, tabela_web, lote)
+            inserir_registros_multi_sem_savepoint(
+                cursor_web, tabela_web, lote, ignorar_conflito=ignorar_conflito
+            )
             cursor_web.execute(f"RELEASE SAVEPOINT {savepoint_nome}_lote")
             inseridos += len(lote)
         except Exception as e:
@@ -1832,6 +1942,14 @@ def inserir_registros_web(cursor_web, tabela_web, registros, campo_chave, savepo
                 cursor_web.execute(f"RELEASE SAVEPOINT {savepoint_nome}_lote")
             except Exception:
                 pass
+
+            global_, motivo = erro_e_global(e)
+            if global_:
+                raise ErroConfiguracaoConversao(
+                    f"Lote {inicio_lote + 1}-{fim_lote} de {tabela_web} falhou por causa global "
+                    f"({motivo}). O fallback item a item foi cancelado porque todos os registros "
+                    f"falhariam igual. Causa raiz: {e}"
+                )
 
             print(
                 f"  [AVISO] Lote {inicio_lote + 1}-{fim_lote} de {tabela_web} "
@@ -1842,7 +1960,9 @@ def inserir_registros_web(cursor_web, tabela_web, registros, campo_chave, savepo
                 chave = registro.get(campo_chave, '?')
                 try:
                     cursor_web.execute(f"SAVEPOINT {savepoint_nome}")
-                    inserir_registro_web_sem_savepoint(cursor_web, tabela_web, registro)
+                    inserir_registro_web_sem_savepoint(
+                        cursor_web, tabela_web, registro, ignorar_conflito=ignorar_conflito
+                    )
                     cursor_web.execute(f"RELEASE SAVEPOINT {savepoint_nome}")
                     inseridos += 1
                 except Exception as erro_item:
@@ -1898,17 +2018,18 @@ def remover_mapa_com_codigos_invalidos(mapa, codigos_invalidos):
     }
 
 
-def inserir_registro_web_sem_savepoint(cursor_web, tabela_web, registro):
+def inserir_registro_web_sem_savepoint(cursor_web, tabela_web, registro, ignorar_conflito=False):
     """Insere um registro assumindo que o SAVEPOINT/transacao ja esta aberto."""
     colunas = list(registro.keys())
     placeholders = ', '.join(['%s'] * len(colunas))
     colunas_str = ', '.join(quote_identificador(col) for col in colunas)
-    sql = f"INSERT INTO {tabela_web} ({colunas_str}) VALUES ({placeholders})"
+    sufixo = " ON CONFLICT DO NOTHING" if ignorar_conflito else ""
+    sql = f"INSERT INTO {tabela_web} ({colunas_str}) VALUES ({placeholders}){sufixo}"
     valores = [registro[col] for col in colunas]
     cursor_web.execute(sql, valores)
 
 
-def inserir_registros_multi_sem_savepoint(cursor_web, tabela_web, registros):
+def inserir_registros_multi_sem_savepoint(cursor_web, tabela_web, registros, ignorar_conflito=False):
     """Insere varios registros em um unico INSERT multi-values."""
     if not registros:
         return
@@ -1922,7 +2043,8 @@ def inserir_registros_multi_sem_savepoint(cursor_web, tabela_web, registros):
     placeholders_linha = '(' + ', '.join(['%s'] * len(colunas)) + ')'
     placeholders = ', '.join([placeholders_linha] * len(registros))
     colunas_str = ', '.join(quote_identificador(col) for col in colunas)
-    sql = f"INSERT INTO {tabela_web} ({colunas_str}) VALUES {placeholders}"
+    sufixo = " ON CONFLICT DO NOTHING" if ignorar_conflito else ""
+    sql = f"INSERT INTO {tabela_web} ({colunas_str}) VALUES {placeholders}{sufixo}"
 
     valores = []
     for registro in registros:
@@ -2138,6 +2260,46 @@ def buscar_fornecedores_giv(cursor_giv, cd_empresa_giv=None):
     return buscar_registros_giv(cursor_giv, sql, params if params else None)
 
 
+# Regra oficial do Web para endereco sem numero, confirmada em
+# projeto_v1/src/adapters/outbound/repositories/fornecedorRepository.ts:
+#   createData.ds_numero = String(nr_endereco ?? '')
+# Ou seja: string vazia, nunca NULL (a coluna e NOT NULL VarChar(15) tanto em
+# fornecedor quanto em usuario e empresa). Nao existe "S/N" no cadastro.
+DS_NUMERO_SEM_NUMERO_WEB = ''
+DS_NUMERO_TAMANHO_MAXIMO_WEB = 15
+
+# Extrai o numero apenas quando ele esta claramente no fim do logradouro,
+# separado por espaco/ponto/virgula/traco, e o restante do logradouro nao
+# termina em digito. Casos duvidosos ficam sem numero, preservando o endereco.
+_RE_NUMERO_NO_FIM_DO_ENDERECO = re.compile(
+    r'^(?P<logradouro>.*[^\d\s.,\-])[\s.,\-]+(?P<numero>\d{1,6})\s*$'
+)
+
+
+def normalizar_ds_numero_web(ds_numero, endereco=None):
+    """
+    Devolve (ds_numero, endereco, extraido) no padrao do Web.
+    - ds_numero nunca e None (coluna NOT NULL): ausencia vira string vazia.
+    - Quando o GIV nao traz numero, tenta extrair do fim do logradouro somente
+      em caso de alta confianca; o logradouro original e preservado nos demais.
+    """
+    numero = limpar_valor(ds_numero)
+    extraido = False
+
+    if numero is None and endereco:
+        casamento = _RE_NUMERO_NO_FIM_DO_ENDERECO.match(str(endereco).strip())
+        if casamento:
+            numero = casamento.group('numero')
+            endereco = casamento.group('logradouro').strip(' .,-')
+            extraido = True
+
+    if numero is None:
+        numero = DS_NUMERO_SEM_NUMERO_WEB
+
+    numero = str(numero).strip()[:DS_NUMERO_TAMANHO_MAXIMO_WEB]
+    return numero, endereco, extraido
+
+
 def converter_fornecedor(registro_giv, cidades_giv, cidades_web, cd_fornecedor_web, tenant_id):
     """Converte fornecedor (GIV) para fornecedor (Web)."""
     razao_social = razao_social_fornecedor_origem(registro_giv)
@@ -2151,6 +2313,11 @@ def converter_fornecedor(registro_giv, cidades_giv, cidades_web, cd_fornecedor_w
     )
     tipos = mapear_tipo_fornecedor(registro_giv.get('id_tipo_fornecedor'))
     ddd_cidade = resolver_ddd_cidade_giv(registro_giv.get('cd_cidade'), cidades_giv)
+
+    ds_numero, endereco, numero_extraido = normalizar_ds_numero_web(
+        registro_giv.get('ds_numero'),
+        limpar_valor(registro_giv.get('endereco'))
+    )
 
     registro_web = {
         'cd_fornecedor': cd_fornecedor_web,
@@ -2167,8 +2334,7 @@ def converter_fornecedor(registro_giv, cidades_giv, cidades_web, cd_fornecedor_w
         'nm_representante': registro_giv.get('nm_representante'),
         'cd_cidade': cd_cidade_web,
         'cep': normalizar_cep(registro_giv.get('cep')),
-        'endereco': registro_giv.get('endereco'),
-        'ds_numero': registro_giv.get('ds_numero'),
+        'endereco': endereco,
         'bairro': registro_giv.get('bairro'),
         'fone': normalizar_telefone_web(registro_giv.get('fone'), ddd=ddd_cidade),
         'celular': normalizar_celular_web(registro_giv.get('fone'), ddd=ddd_cidade),
@@ -2176,7 +2342,12 @@ def converter_fornecedor(registro_giv, cidades_giv, cidades_web, cd_fornecedor_w
         'observacao': registro_giv.get('observacao'),
         'site': registro_giv.get('site'),
     }
-    return limpar_registro(registro_web)
+    registro_web = limpar_registro(registro_web)
+    # Gravado depois de limpar_registro porque a coluna e NOT NULL e limpar_valor
+    # converteria a string vazia oficial do Web em None.
+    registro_web['ds_numero'] = ds_numero
+    registro_web['_numero_extraido_do_endereco'] = numero_extraido
+    return registro_web
 
 
 def processar_grupos(cursor_giv, cursor_web, tabela_web_grupo, tenant_id, cd_empresa, cd_empresa_giv=None):
@@ -3247,19 +3418,42 @@ def processar_grades_produto(
 
     itens_giv = buscar_grade_itens_giv(cursor_giv, cd_empresa_giv)
     tamanhos_por_grade = buscar_tamanhos_por_grade_web(cursor_web, tabela_web_grade_tamanho)
+    # O par (A, B) e a PK de "_gradeTotamanho". Alem de pular o que ja existe no
+    # Web, precisamos deduplicar dentro do proprio lote: o GIV pode repetir o
+    # mesmo (grade, tamanho) e antes isso virava erro fatal de chave duplicada.
     itens = []
+    ja_no_lote = set()
+    duplicados_giv = 0
+    ja_existiam_web = 0
     for item in itens_giv:
         cd_grade_web = mapa.get(item.get('cd_grade'))
         cd_tamanho_web = mapa_tamanhos.get(item.get('cd_tamanho'))
-        if cd_grade_web and cd_tamanho_web and cd_tamanho_web not in tamanhos_por_grade.get(cd_grade_web, set()):
-            itens.append({'A': cd_grade_web, 'B': cd_tamanho_web})
+        if not cd_grade_web or not cd_tamanho_web:
+            continue
+        if cd_tamanho_web in tamanhos_por_grade.get(cd_grade_web, set()):
+            ja_existiam_web += 1
+            continue
+        par = (cd_grade_web, cd_tamanho_web)
+        if par in ja_no_lote:
+            duplicados_giv += 1
+            continue
+        ja_no_lote.add(par)
+        itens.append({'A': cd_grade_web, 'B': cd_tamanho_web})
+
+    if ja_existiam_web:
+        print(f"[OK] grade/tamanho: {ja_existiam_web} vinculos ja existiam no Web e foram reaproveitados.")
+    if duplicados_giv:
+        print(f"[OK] grade/tamanho: {duplicados_giv} vinculos duplicados no GIV foram ignorados.")
 
     _, erros_relacao, erros_relacao_detalhe = inserir_registros_web(
         cursor_web,
         tabela_web_grade_tamanho,
         itens,
         'A',
-        'sp_grade_tamanho'
+        'sp_grade_tamanho',
+        # "_gradeTotamanho" e uma tabela de vinculo com PK (A, B) e sem outras
+        # colunas: um par que ja exista nao e falha, e apenas reaproveitamento.
+        ignorar_conflito=True
     )
 
     for item in itens:
@@ -3818,10 +4012,28 @@ def processar_fornecedores(
             )
         )
 
+    numeros_extraidos = 0
+    numeros_ausentes = 0
+    for registro in fornecedores_web:
+        if registro.pop('_numero_extraido_do_endereco', False):
+            numeros_extraidos += 1
+        if not registro.get('ds_numero'):
+            numeros_ausentes += 1
+
     print(
         f"[OK] {len(fornecedores_web)} fornecedores para inserir "
         f"(nenhum fornecedor foi pulado por ja existir no Web)."
     )
+    if numeros_extraidos:
+        print(
+            f"[INFO] Fornecedor: numero extraido do fim do logradouro em {numeros_extraidos} "
+            "registros (logradouro preservado nos demais)."
+        )
+    if numeros_ausentes:
+        print(
+            f"[INFO] Fornecedor: {numeros_ausentes} registros ficaram sem numero e usaram o "
+            "padrao do Web (ds_numero = string vazia, nunca NULL)."
+        )
     garantir_ceps_fornecedor_api(fornecedores_web, cursor_web, session_api_cep, base_url_api_cep)
 
     inseridos, erros, erros_detalhe = inserir_registros_web(
@@ -4487,7 +4699,37 @@ def buscar_produtos_giv(cursor_giv):
             CASE WHEN COALESCE(p.cd_produto_pai, 0) = 0 THEN 0 ELSE 1 END,
             p.cd_produto
     """
-    return buscar_registros_giv(cursor_giv, sql)
+    produtos = buscar_registros_giv(cursor_giv, sql)
+    return aplicar_limite_produtos(produtos)
+
+
+def aplicar_limite_produtos(produtos):
+    """
+    Aplica --limit-products mantendo a familia intacta: pega as N primeiras
+    raizes e leva junto todos os filhos delas, para o teste cobrir produto
+    simples, produto pai e produtos filhos.
+    """
+    if not LIMITE_PRODUTOS_CONVERSAO or LIMITE_PRODUTOS_CONVERSAO <= 0:
+        return produtos
+
+    raizes = []
+    for reg in produtos:
+        if not reg.get('cd_produto_pai'):
+            raizes.append(reg.get('cd_produto'))
+            if len(raizes) >= LIMITE_PRODUTOS_CONVERSAO:
+                break
+
+    codigos_raiz = set(raizes)
+    selecionados = [
+        reg for reg in produtos
+        if reg.get('cd_produto') in codigos_raiz
+        or reg.get('cd_produto_pai') in codigos_raiz
+    ]
+    print(
+        f"[INFO] --limit-products={LIMITE_PRODUTOS_CONVERSAO}: {len(selecionados)} produtos "
+        f"selecionados ({len(codigos_raiz)} raizes + filhos) de {len(produtos)} do GIV."
+    )
+    return selecionados
 
 
 def buscar_precos_produto_giv(cursor_giv):
@@ -5275,6 +5517,14 @@ def inserir_produtos_raiz_lote_transacional(cursor_web, tabelas_web, itens, limi
             except Exception:
                 pass
 
+            global_, motivo = erro_e_global(e)
+            if global_:
+                raise ErroConfiguracaoConversao(
+                    f"Lote raiz {inicio_lote + 1}-{fim_lote} falhou por causa global ({motivo}). "
+                    f"Nenhum produto seria inserido item a item, entao a etapa foi interrompida "
+                    f"antes de processar os {total} produtos. Causa raiz: {e}"
+                )
+
             print(
                 f"  [AVISO] Lote raiz {inicio_lote + 1}-{fim_lote} falhou em lote; "
                 f"tentando item a item... Causa: {e}",
@@ -5372,6 +5622,14 @@ def inserir_produtos_filhos_lote_transacional(cursor_web, tabelas_web, itens, li
             except Exception:
                 pass
 
+            global_, motivo = erro_e_global(e)
+            if global_:
+                raise ErroConfiguracaoConversao(
+                    f"Lote filho {inicio_lote + 1}-{fim_lote} falhou por causa global ({motivo}). "
+                    f"A etapa foi interrompida antes de processar os {total} produtos filhos. "
+                    f"Causa raiz: {e}"
+                )
+
             print(
                 f"  [AVISO] Lote filho {inicio_lote + 1}-{fim_lote} falhou em lote; "
                 f"tentando item a item... Causa: {e}",
@@ -5410,8 +5668,246 @@ def inserir_produtos_filhos_lote_transacional(cursor_web, tabelas_web, itens, li
     return inseridos, erros, erros_detalhe, sucessos
 
 
+class ErroConfiguracaoConversao(Exception):
+    """Pre-requisito critico ausente no Web; a conversao deve parar antes de gravar."""
+
+
+def _consultar_config_tabela_preco_empresa(cursor_web, tabela_config, tenant_id, cd_empresa):
+    """Le sys_config_values('tabela_preco_padrao', escopo empresa). Mesma query do Web."""
+    cursor_web.execute("SAVEPOINT sp_cfg_tabela_preco")
+    try:
+        cursor_web.execute(
+            f"""
+            SELECT {quote_identificador('value')}
+              FROM {tabela_config}
+             WHERE {quote_identificador('key')} = %s
+               AND {quote_identificador('scope_type')} = 'empresa'
+               AND {quote_identificador('tenant_id')} = %s
+               AND {quote_identificador('cd_empresa')} = %s
+             ORDER BY {quote_identificador('value')}
+             LIMIT 1
+            """,
+            (CONFIG_TABELA_PRECO_PADRAO, tenant_id, cd_empresa)
+        )
+        row = cursor_web.fetchone()
+        cursor_web.execute("RELEASE SAVEPOINT sp_cfg_tabela_preco")
+    except Exception as e:
+        try:
+            cursor_web.execute("ROLLBACK TO SAVEPOINT sp_cfg_tabela_preco")
+            cursor_web.execute("RELEASE SAVEPOINT sp_cfg_tabela_preco")
+        except Exception:
+            pass
+        print(f"[AVISO] Nao foi possivel ler {CONFIG_TABELA_PRECO_PADRAO} em sys_config_values: {e}")
+        return None
+
+    if not row:
+        return None
+    texto = str(row[0] or '').strip()
+    if not texto.isdigit():
+        return None
+    codigo = int(texto)
+    return codigo if codigo > 0 else None
+
+
+def _tabela_preco_ativa_do_tenant(cursor_web, tabela_web_preco, tenant_id, cd_tabela_preco):
+    """Confere o par (tenant_id, cd_tabela_preco) exigido pela FK, exigindo id_status='A'."""
+    cursor_web.execute(
+        f"""
+        SELECT {quote_identificador('cd_tabela_preco')}
+          FROM {tabela_web_preco}
+         WHERE {quote_identificador('tenant_id')} = %s
+           AND {quote_identificador('cd_tabela_preco')} = %s
+           AND COALESCE({quote_identificador('id_status')}, 'A') = 'A'
+         LIMIT 1
+        """,
+        (tenant_id, cd_tabela_preco)
+    )
+    row = cursor_web.fetchone()
+    return int(row[0]) if row else None
+
+
+def _primeira_tabela_preco_ativa_do_tenant(cursor_web, tabela_web_preco, tenant_id):
+    """Mesma regra do fallback da migration 20260715210000 (primeira tabela ativa do tenant)."""
+    cursor_web.execute(
+        f"""
+        SELECT {quote_identificador('cd_tabela_preco')},
+               {quote_identificador('ds_tabela_preco')}
+          FROM {tabela_web_preco}
+         WHERE {quote_identificador('tenant_id')} = %s
+           AND COALESCE({quote_identificador('id_status')}, 'A') = 'A'
+         ORDER BY {quote_identificador('cd_tabela_preco')}
+         LIMIT 1
+        """,
+        (tenant_id,)
+    )
+    row = cursor_web.fetchone()
+    return (int(row[0]), row[1]) if row else (None, None)
+
+
+def _gravar_config_tabela_preco_empresa(cursor_web, tabela_config, tenant_id, cd_empresa, cd_tabela_preco):
+    """Grava sys_config_values no escopo 'empresa' respeitando a unique ux_config_scope."""
+    cursor_web.execute(
+        f"""
+        UPDATE {tabela_config}
+           SET {quote_identificador('value')} = %s
+         WHERE {quote_identificador('key')} = %s
+           AND {quote_identificador('scope_type')} = 'empresa'
+           AND {quote_identificador('tenant_id')} = %s
+           AND {quote_identificador('cd_empresa')} = %s
+        """,
+        (str(cd_tabela_preco), CONFIG_TABELA_PRECO_PADRAO, tenant_id, cd_empresa)
+    )
+    if cursor_web.rowcount:
+        return
+
+    cursor_web.execute(
+        f"""
+        INSERT INTO {tabela_config} (
+            {quote_identificador('key')},
+            {quote_identificador('scope_type')},
+            {quote_identificador('tenant_id')},
+            {quote_identificador('cd_empresa')},
+            {quote_identificador('value')}
+        ) VALUES (%s, 'empresa', %s, %s, %s)
+        """,
+        (CONFIG_TABELA_PRECO_PADRAO, tenant_id, cd_empresa, str(cd_tabela_preco))
+    )
+
+
+def _criar_tabela_preco_padrao(cursor_web, tabela_web_preco, tenant_id):
+    """Cria a tabela de preco padrao do tenant com os mesmos campos usados no cadastro de empresa."""
+    sequence_preco = buscar_sequence_coluna_web(cursor_web, tabela_web_preco, 'cd_tabela_preco')
+    sincronizar_sequence_com_max(cursor_web, tabela_web_preco, 'cd_tabela_preco', sequence_preco)
+    cd_tabela_preco = proximo_valor_sequence(cursor_web, sequence_preco)
+    inserir_registro_web_sem_savepoint(cursor_web, tabela_web_preco, {
+        'cd_tabela_preco': cd_tabela_preco,
+        'ds_tabela_preco': DS_TABELA_PRECO_PADRAO_CONVERSAO,
+        'id_status': 'A',
+        'pr_margem_lucro': Decimal('0'),
+        'tenant_id': tenant_id,
+    })
+    return cd_tabela_preco
+
+
+def resolver_tabela_preco_padrao_web(
+    cursor_web,
+    tenant_id,
+    cd_empresa,
+    permitir_criar=True,
+    simular=False
+):
+    """
+    Resolve o cd_tabela_preco que sera gravado em produto_preco, seguindo a regra
+    oficial do Web. Ordem:
+      1. sys_config_values('tabela_preco_padrao', escopo empresa) validado em tabela_preco;
+      2. primeira tabela ativa do tenant (mesmo fallback da migration oficial), gravando a config;
+      3. criacao de "TABELA PADRAO" quando o tenant nao possui nenhuma tabela ativa.
+    Levanta ErroConfiguracaoConversao quando nao for seguro seguir.
+    Retorna (cd_tabela_preco, origem).
+    """
+    tabela_web_preco = resolver_tabela_web_opcional(cursor_web, "tabela_preco")
+    if not tabela_web_preco:
+        raise ErroConfiguracaoConversao(
+            "Tabela \"tabela_preco\" nao existe no banco Web. "
+            "Rode as migrations do projeto Web antes de converter produtos."
+        )
+    tabela_config = resolver_tabela_web_opcional(cursor_web, "sys_config_values")
+
+    cd_config = (
+        _consultar_config_tabela_preco_empresa(cursor_web, tabela_config, tenant_id, cd_empresa)
+        if tabela_config else None
+    )
+    if cd_config:
+        cd_valido = _tabela_preco_ativa_do_tenant(cursor_web, tabela_web_preco, tenant_id, cd_config)
+        if cd_valido:
+            print(
+                f"[OK] Tabela de preco padrao da empresa: cd_tabela_preco={cd_valido} "
+                f"(sys_config_values.{CONFIG_TABELA_PRECO_PADRAO}, tenant_id={tenant_id}, "
+                f"cd_empresa={cd_empresa})."
+            )
+            return cd_valido, 'config_empresa'
+        print(
+            f"[AVISO] sys_config_values aponta cd_tabela_preco={cd_config}, mas ele nao existe "
+            f"ativo no tenant_id={tenant_id}. A configuracao sera corrigida."
+        )
+
+    cd_primeira, ds_primeira = _primeira_tabela_preco_ativa_do_tenant(
+        cursor_web, tabela_web_preco, tenant_id
+    )
+    if cd_primeira:
+        if simular:
+            print(
+                f"[DRY-RUN] Usaria a primeira tabela ativa do tenant: cd_tabela_preco={cd_primeira} "
+                f"({ds_primeira}); a config de empresa seria gravada."
+            )
+            return cd_primeira, 'primeira_ativa_simulada'
+        if not tabela_config:
+            raise ErroConfiguracaoConversao(
+                "Tabela \"sys_config_values\" nao existe no banco Web; nao e possivel definir a "
+                "tabela de preco padrao da empresa conforme a regra atual do sistema."
+            )
+        _gravar_config_tabela_preco_empresa(
+            cursor_web, tabela_config, tenant_id, cd_empresa, cd_primeira
+        )
+        print(
+            f"[OK] Tabela de preco padrao definida para a empresa: cd_tabela_preco={cd_primeira} "
+            f"({ds_primeira}) - primeira tabela ativa do tenant, mesma regra da migration oficial."
+        )
+        return cd_primeira, 'primeira_ativa'
+
+    if not permitir_criar:
+        raise ErroConfiguracaoConversao(
+            f"O tenant_id={tenant_id} nao possui nenhuma tabela de preco ativa e a criacao "
+            "automatica esta desabilitada. Cadastre uma tabela de preco no Web e defina-a como "
+            "padrao da empresa em Configuracoes antes de converter produtos."
+        )
+
+    if simular:
+        print(
+            f"[DRY-RUN] O tenant_id={tenant_id} nao possui tabela de preco ativa; seria criada "
+            f"\"{DS_TABELA_PRECO_PADRAO_CONVERSAO}\" e vinculada a cd_empresa={cd_empresa}."
+        )
+        return None, 'criaria'
+
+    if not tabela_config:
+        raise ErroConfiguracaoConversao(
+            "Tabela \"sys_config_values\" nao existe no banco Web; nao e possivel definir a "
+            "tabela de preco padrao da empresa conforme a regra atual do sistema."
+        )
+
+    cd_nova = _criar_tabela_preco_padrao(cursor_web, tabela_web_preco, tenant_id)
+    _gravar_config_tabela_preco_empresa(cursor_web, tabela_config, tenant_id, cd_empresa, cd_nova)
+    print(
+        f"[OK] Tabela de preco criada para o tenant_id={tenant_id}: cd_tabela_preco={cd_nova} "
+        f"(\"{DS_TABELA_PRECO_PADRAO_CONVERSAO}\", id_status=A) e definida como padrao da "
+        f"cd_empresa={cd_empresa}."
+    )
+    return cd_nova, 'criada'
+
+
+def definir_tabela_preco_padrao_produto(
+    cursor_web,
+    tenant_id,
+    cd_empresa,
+    permitir_criar=True,
+    simular=False
+):
+    """Resolve e publica o cd_tabela_preco usado por montar_precos_web()."""
+    global CD_TABELA_PRECO_PRODUTO_PADRAO
+    cd_tabela_preco, origem = resolver_tabela_preco_padrao_web(
+        cursor_web, tenant_id, cd_empresa, permitir_criar=permitir_criar, simular=simular
+    )
+    CD_TABELA_PRECO_PRODUTO_PADRAO = cd_tabela_preco
+    return cd_tabela_preco, origem
+
+
 def montar_precos_web(precos_giv, cd_produto_web, tenant_id):
-    """Monta produto_preco usando sempre a tabela de preco padrao do Web."""
+    """Monta produto_preco usando sempre a tabela de preco padrao resolvida para a empresa."""
+    if not CD_TABELA_PRECO_PRODUTO_PADRAO:
+        raise ErroConfiguracaoConversao(
+            "Tabela de preco padrao nao resolvida. definir_tabela_preco_padrao_produto() precisa "
+            "rodar antes de montar qualquer produto_preco."
+        )
     if not precos_giv:
         precos_giv = [{}]
     return [
@@ -5663,6 +6159,117 @@ def inserir_estoque_produtos_reaproveitados(
     }
 
 
+def validar_tenant_empresa_web(cursor_web, tenant_id, cd_empresa):
+    """Confere que o tenant existe e que a empresa pertence a esse tenant."""
+    tabela_tenant = resolver_tabela_web_opcional(cursor_web, "tenant")
+    tabela_empresa = resolver_tabela_web_opcional(cursor_web, "empresa")
+    if not tabela_tenant or not tabela_empresa:
+        raise ErroConfiguracaoConversao(
+            "Tabelas \"tenant\"/\"empresa\" nao encontradas no banco Web."
+        )
+
+    cursor_web.execute(
+        f"SELECT 1 FROM {tabela_tenant} WHERE {quote_identificador('id')} = %s",
+        (tenant_id,)
+    )
+    if not cursor_web.fetchone():
+        raise ErroConfiguracaoConversao(
+            f"tenant_id={tenant_id} nao existe no banco Web."
+        )
+
+    cursor_web.execute(
+        f"""
+        SELECT {quote_identificador('tenant_id')}
+          FROM {tabela_empresa}
+         WHERE {quote_identificador('cd_empresa')} = %s
+        """,
+        (cd_empresa,)
+    )
+    row = cursor_web.fetchone()
+    if not row:
+        raise ErroConfiguracaoConversao(
+            f"cd_empresa={cd_empresa} nao existe no banco Web."
+        )
+    if int(row[0]) != int(tenant_id):
+        raise ErroConfiguracaoConversao(
+            f"cd_empresa={cd_empresa} pertence ao tenant_id={row[0]}, e nao ao "
+            f"tenant_id={tenant_id} informado. Corrija os parametros da conversao."
+        )
+    print(f"[OK] Preflight: tenant_id={tenant_id} existe e cd_empresa={cd_empresa} pertence a ele.")
+
+
+def preflight_produto(cursor_web, tabelas_web, tenant_id, cd_empresa, simular=False):
+    """
+    Valida os pre-requisitos criticos ANTES de reservar codigos e montar produtos.
+    Levanta ErroConfiguracaoConversao para interromper a etapa sem gravar nada.
+    """
+    print()
+    print("[...] Preflight de produto: validando pre-requisitos no Web...")
+
+    validar_tenant_empresa_web(cursor_web, tenant_id, cd_empresa)
+
+    obrigatorias = (
+        'produto', 'produto_info', 'produto_filho', 'produto_preco',
+        'produto_estoque', 'produto_colecao',
+    )
+    faltando = [
+        nome for nome in obrigatorias
+        if not tabelas_web.get(nome)
+        or not resolver_tabela_web_opcional(cursor_web, nome)
+    ]
+    if faltando:
+        raise ErroConfiguracaoConversao(
+            f"Tabelas ausentes no banco Web: {', '.join(faltando)}. "
+            "Rode as migrations do projeto Web."
+        )
+
+    cd_tabela_preco, origem = definir_tabela_preco_padrao_produto(
+        cursor_web, tenant_id, cd_empresa, simular=simular
+    )
+    if not simular:
+        if not cd_tabela_preco:
+            raise ErroConfiguracaoConversao(
+                "Nao foi possivel resolver a tabela de preco padrao da empresa."
+            )
+        # Revalida o par exigido pela FK fk_produto_preco_tabela_tenant.
+        tabela_web_preco = resolver_tabela_web_opcional(cursor_web, "tabela_preco")
+        if not _tabela_preco_ativa_do_tenant(cursor_web, tabela_web_preco, tenant_id, cd_tabela_preco):
+            raise ErroConfiguracaoConversao(
+                f"O par (tenant_id={tenant_id}, cd_tabela_preco={cd_tabela_preco}) nao esta "
+                "presente e ativo em tabela_preco. produto_preco violaria "
+                "fk_produto_preco_tabela_tenant."
+            )
+        print(
+            f"[OK] Preflight: produto_preco usara cd_tabela_preco={cd_tabela_preco} "
+            f"(origem: {origem}); par (tenant_id, cd_tabela_preco) confirmado em tabela_preco."
+        )
+
+    if not buscar_sequence_coluna_web(cursor_web, tabelas_web['produto'], 'cd_produto'):
+        raise ErroConfiguracaoConversao(
+            "Sequence de produto.cd_produto nao encontrada no banco Web."
+        )
+    print("[OK] Preflight: tabelas e sequences de produto confirmadas.")
+    return cd_tabela_preco
+
+
+def validar_padroes_produto_preflight(padroes_produto):
+    """Confere que os padroes obrigatorios de produto foram resolvidos no Web."""
+    obrigatorios = {
+        'cd_marca': 'marca',
+        'cd_grupo': 'grupo',
+        'cd_fornecedor': 'fornecedor',
+    }
+    ausentes = [
+        rotulo for chave, rotulo in obrigatorios.items()
+        if not padroes_produto.get(chave)
+    ]
+    if ausentes:
+        raise ErroConfiguracaoConversao(
+            "Cadastros padrao obrigatorios ausentes no Web para este tenant/empresa: "
+            f"{', '.join(ausentes)}. Converta esses cadastros antes de produto."
+        )
+
+
 def processar_produtos(
     cursor_giv,
     cursor_web,
@@ -5677,6 +6284,8 @@ def processar_produtos(
 ):
     print()
     resumos = []
+
+    preflight_produto(cursor_web, tabelas_web, tenant_id, cd_empresa)
 
     print("[...] Carregando mapas de cadastros auxiliares para produto...")
     mapas = carregar_mapas_cadastros_produto(
@@ -5718,7 +6327,11 @@ def processar_produtos(
         f"marca={padroes_produto.get('cd_marca')}, grupo={padroes_produto.get('cd_grupo')}, "
         f"fornecedor={padroes_produto.get('cd_fornecedor')}."
     )
-    print(f"[INFO] Produto: produto_preco gravara cd_tabela_preco padrao {CD_TABELA_PRECO_PRODUTO_PADRAO}.")
+    validar_padroes_produto_preflight(padroes_produto)
+    print(
+        f"[INFO] Produto: produto_preco gravara cd_tabela_preco={CD_TABELA_PRECO_PRODUTO_PADRAO} "
+        f"(tabela de preco padrao da cd_empresa={cd_empresa} no tenant_id={tenant_id})."
+    )
 
     sequence_produto = buscar_sequence_coluna_web(
         cursor_web,
@@ -5791,8 +6404,22 @@ def processar_produtos(
         f"{len(fornecedores_produtos)} codigos GIV mapeados para fornecedor Web."
     )
     if len(fornecedores_mapeados) < len(fornecedores_produtos):
+        sem_de_para = sorted(fornecedores_produtos - fornecedores_mapeados)
+        produtos_com_padrao = sum(
+            1 for reg in produtos_giv
+            if reg.get('cd_fornecedor') is None
+            or reg.get('cd_fornecedor') not in mapas.get('fornecedor', {})
+        )
+        # produto_info.cd_fornecedor e NOT NULL no Web (schema.prisma), entao o
+        # produto NUNCA fica sem fornecedor: usa o fornecedor padrao do tenant.
         print(
-            "[INFO] Produtos com fornecedor informado, mas sem de/para, ficarao sem fornecedor no produto."
+            f"[INFO] Produtos sem de/para de fornecedor usarao o fornecedor padrao do Web "
+            f"(cd_fornecedor={padroes_produto.get('cd_fornecedor')}): {produtos_com_padrao} produtos."
+        )
+        print(
+            f"[INFO] Fornecedores GIV sem correspondencia no Web ({len(sem_de_para)}): "
+            f"{', '.join(str(c) for c in sem_de_para[:20])}"
+            + (" ..." if len(sem_de_para) > 20 else "")
         )
 
     limites = {
@@ -5836,10 +6463,13 @@ def processar_produtos(
         f"[INFO] Produtos no tenant: {produtos_reaproveitados_tenant} reaproveitados, "
         f"{total_codigos} novos para cadastrar."
     )
-    print(f"[...] Reservando {total_codigos} codigos da sequence de produto em lote...")
-    codigos_produto = reservar_valores_sequence(cursor_web, sequence_produto, total_codigos) if total_codigos else []
-    indice_codigo = 0
-    print(f"[OK] {len(codigos_produto)} codigos reservados.")
+    print(
+        f"[...] Reservando codigos da sequence de produto sob demanda, em blocos de "
+        f"{TAMANHO_BLOCO_SEQUENCE_PRODUTO} (ate {total_codigos})..."
+    )
+    codigos_produto = gerador_codigos_sequence(
+        cursor_web, sequence_produto, total_codigos, TAMANHO_BLOCO_SEQUENCE_PRODUTO
+    )
 
     print()
     print(f"[...] Montando {len(raizes)} produtos raiz/simples para insert em lote...")
@@ -5849,8 +6479,7 @@ def processar_produtos(
     ultimo_log_raizes_qtd = 0
     for i, reg in enumerate(raizes, start=1):
         cd_produto_giv = reg.get('cd_produto')
-        cd_produto_web = codigos_produto[indice_codigo]
-        indice_codigo += 1
+        cd_produto_web = next(codigos_produto)
         barcode = barcodes_por_produto.get(cd_produto_giv)
 
         produto, produto_info, erros_validacao = montar_produto_raiz_web(
@@ -5966,8 +6595,7 @@ def processar_produtos(
                 proximos_pendentes.append(reg)
                 continue
 
-            cd_produto_web = codigos_produto[indice_codigo]
-            indice_codigo += 1
+            cd_produto_web = next(codigos_produto)
             barcode = barcodes_por_produto.get(cd_produto_giv)
             produto, produto_filho, erros_validacao = montar_produto_filho_web(
                 reg,
@@ -6024,8 +6652,7 @@ def processar_produtos(
             itens_orfaos = []
             for reg in proximos_pendentes:
                 cd_produto_giv = reg.get('cd_produto')
-                cd_produto_web = codigos_produto[indice_codigo]
-                indice_codigo += 1
+                cd_produto_web = next(codigos_produto)
                 barcode = barcodes_por_produto.get(cd_produto_giv)
                 produto, produto_info, erros_validacao = montar_produto_raiz_web(
                     reg,
@@ -6688,6 +7315,7 @@ def cadastrar_produtos_faltantes_rotinas(
         f"[...] Cadastrando {len(codigos_faltantes)} produtos faltantes usados "
         "nas rotinas/documentos..."
     )
+    preflight_produto(cursor_web, tabelas_web_produto, tenant_id, cd_empresa)
     produtos_giv = buscar_produtos_giv(cursor_giv)
     produtos_por_codigo = {}
     for reg in produtos_giv:
@@ -9825,6 +10453,11 @@ def criar_empresa_base_web(cursor_web, tabelas_web, dados):
             inseridos = inserir_empresa_base_sem_retorno(cursor_web, tabelas_web, chave_tabela, registros, nome_resumo)
             adicionar_resumo_empresa(resumos, nome_resumo, len(registros), inseridos)
 
+    # A tabela de preco criada acima so passa a valer como padrao depois de
+    # registrada em sys_config_values no escopo da empresa (regra oficial do Web:
+    # migration 20260715210000_tabela_preco_padrao_por_empresa).
+    definir_tabela_preco_padrao_produto(cursor_web, tenant_id, cd_empresa)
+
     resumo_situacoes = inserir_situacoes_tributarias_base(cursor_web, tabelas_web, tenant_id, cd_empresa)
     resumos.append(resumo_situacoes)
 
@@ -11469,6 +12102,10 @@ def gerar_sql_reversao(estado, tabelas_web):
 
 def gravar_reverter_txt(estado_reversao, tabelas_web):
     """Grava reverter.txt com comandos para desfazer a conversao confirmada."""
+    if MODO_DRY_RUN:
+        print()
+        print("[DRY-RUN] reverter.txt nao foi gravado (nenhuma alteracao sera efetivada).")
+        return None
     pasta_saida = limpar_valor(os.environ.get("CONVERTER_OUTPUT_DIR"))
     if not pasta_saida:
         if getattr(sys, "frozen", False):
@@ -11489,6 +12126,16 @@ def gravar_reverter_txt(estado_reversao, tabelas_web):
 
 
 def confirmar_transacao(conn_web):
+    if MODO_DRY_RUN:
+        conn_web.rollback()
+        print()
+        print("=" * 60)
+        print("[DRY-RUN] Simulacao concluida. ROLLBACK executado automaticamente.")
+        print("[DRY-RUN] Nenhum INSERT, UPDATE ou DELETE foi efetivado no banco Web.")
+        print("[DRY-RUN] Os numeros acima mostram exatamente o que seria gravado.")
+        print("=" * 60)
+        return
+
     print()
     print(">>> A transacao esta ABERTA no PostgreSQL remoto. <<<")
     print(">>> Nenhum dado foi efetivado ainda.              <<<")
@@ -11737,11 +12384,67 @@ def solicitar_uso_api_cep():
         print("Opcao invalida. Digite S para usar API ou N para pular.")
 
 
+# Flags que pertencem a converter_gui.py; o conversor as ignora ao ler argv.
+ARGUMENTOS_DA_INTERFACE = ('--run-converter', '--test-giv', '--test-web')
+
+
+def _valor_booleano_env(valor):
+    return str(valor or '').strip().lower() in ('1', 's', 'sim', 'true', 'y', 'yes')
+
+
+def parse_argumentos_execucao(argv=None):
+    """
+    Le os modos de execucao segura da linha de comando ou do ambiente:
+      --dry-run              conecta, valida e monta tudo, mas termina em ROLLBACK.
+      --limit-products N     converte apenas N produtos raiz (com todos os filhos deles).
+    Equivalentes por variavel de ambiente, usados pela interface grafica:
+      CONVERTER_DRY_RUN=1
+      CONVERTER_LIMIT_PRODUCTS=25
+    """
+    global MODO_DRY_RUN, LIMITE_PRODUTOS_CONVERSAO
+
+    if _valor_booleano_env(os.environ.get("CONVERTER_DRY_RUN")):
+        MODO_DRY_RUN = True
+    limite_env = limpar_valor(os.environ.get("CONVERTER_LIMIT_PRODUCTS"))
+    if limite_env and limite_env.isdigit():
+        LIMITE_PRODUTOS_CONVERSAO = int(limite_env)
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ARGUMENTOS_DA_INTERFACE:
+            pass
+        elif arg in ('--dry-run', '--simular'):
+            MODO_DRY_RUN = True
+        elif arg in ('--limit-products', '--limite-produtos'):
+            i += 1
+            if i >= len(argv):
+                print("[ERRO] --limit-products exige um numero.")
+                sys.exit(2)
+            LIMITE_PRODUTOS_CONVERSAO = int(argv[i])
+        elif arg.startswith('--limit-products=') or arg.startswith('--limite-produtos='):
+            LIMITE_PRODUTOS_CONVERSAO = int(arg.split('=', 1)[1])
+        elif arg in ('-h', '--help'):
+            print("Uso: converter.py [--dry-run] [--limit-products N]")
+            sys.exit(0)
+        else:
+            print(f"[ERRO] Argumento desconhecido: {arg}")
+            sys.exit(2)
+        i += 1
+
+
 def main():
+    parse_argumentos_execucao()
+
     print("=" * 60)
     print("  CONVERSOR DE DADOS - GIV -> Web")
     print("  Tabelas: cadastros base | produto | documentos | financeiro")
     print("=" * 60)
+    if MODO_DRY_RUN:
+        print("  MODO DRY-RUN: nada sera efetivado; a transacao termina em ROLLBACK.")
+    if LIMITE_PRODUTOS_CONVERSAO:
+        print(f"  LIMITE DE PRODUTOS: {LIMITE_PRODUTOS_CONVERSAO} raizes (mais os filhos delas).")
     print()
 
     tabelas_selecionadas = solicitar_tabelas_para_converter()
@@ -12535,6 +13238,20 @@ def main():
         )
         gravar_reverter_txt(estado_reversao, tabelas_web_reversao)
         confirmar_transacao(conn_web)
+
+    except ErroConfiguracaoConversao as e:
+        print()
+        print("=" * 60)
+        print("[PARADA SEGURA] Pre-requisito ausente no banco Web.")
+        print(f"  {e}")
+        print("  Nenhum dado foi efetivado; a transacao inteira sera desfeita.")
+        print("=" * 60)
+        try:
+            conn_web.rollback()
+            print("[OK] ROLLBACK realizado com sucesso.")
+        except Exception:
+            print("[ERRO] Falha ao realizar rollback.")
+        sys.exit(1)
 
     except Exception as e:
         print()

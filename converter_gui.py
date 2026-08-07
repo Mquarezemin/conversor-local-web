@@ -565,6 +565,8 @@ class ConverterGUI(tk.Tk):
         self.final_decision_sent = False
         self.table_vars = {}
         self.selected_count_var = tk.StringVar(value=f"Selecionados: 0 / {len(TABLE_OPTIONS)}")
+        self.dry_run_var = tk.BooleanVar(value=False)
+        self.limite_produtos_var = tk.StringVar(value="")
         self.connection_status_vars = {}
         self.connection_status_labels = {}
         self.progress_task_keys = []
@@ -855,6 +857,22 @@ class ConverterGUI(tk.Tk):
         self.reverter_btn.pack(side="left", padx=(0, 8))
         ttk.Button(controls, text="Limpar logs", command=self.clear_logs, style="Secondary.TButton").pack(side="left")
 
+        # Modos de execucao segura (equivalentes a --dry-run e --limit-products).
+        seguranca = ttk.Frame(right, style="App.TFrame")
+        seguranca.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            seguranca,
+            text="Simulacao (dry-run): valida tudo e termina em ROLLBACK",
+            variable=self.dry_run_var,
+        ).pack(side="left", padx=(0, 16))
+        ttk.Label(seguranca, text="Limitar produtos:", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+        ttk.Entry(seguranca, textvariable=self.limite_produtos_var, width=8).pack(side="left")
+        ttk.Label(
+            seguranca,
+            text="(quantidade de produtos raiz; vazio = todos)",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=(6, 0))
+
         progress = ttk.LabelFrame(right, text="Progresso", padding=(12, 10), style="Card.TLabelframe")
         progress.pack(fill="x", pady=(12, 12))
         self.item_label = tk.StringVar(value="Tabela atual: -")
@@ -950,6 +968,18 @@ class ConverterGUI(tk.Tk):
                 env[env_name] = value
             elif env_name in env:
                 env.pop(env_name, None)
+
+        # Modos de execucao segura lidos por converter.parse_argumentos_execucao().
+        if self.dry_run_var.get():
+            env["CONVERTER_DRY_RUN"] = "1"
+        else:
+            env.pop("CONVERTER_DRY_RUN", None)
+
+        limite = self.limite_produtos_var.get().strip()
+        if limite.isdigit() and int(limite) > 0:
+            env["CONVERTER_LIMIT_PRODUCTS"] = limite
+        else:
+            env.pop("CONVERTER_LIMIT_PRODUCTS", None)
         return env
 
     def selected_tables(self):
