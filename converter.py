@@ -3740,7 +3740,23 @@ def buscar_tamanhos_por_grade_web(cursor_web, tabela_web_grade_tamanho):
 
 
 def buscar_mapa_fornecedor_produto(cursor_giv, cursor_web, tabela_web_fornecedor, tenant_id, cd_empresa_giv=None):
-    """Relaciona fornecedor GIV -> fornecedor Web por documento ou nome."""
+    """
+    Relaciona fornecedor GIV -> fornecedor Web por documento e nome.
+
+    O GIV repete o mesmo CNPJ em cadastros diferentes (nesta base, 12 documentos
+    aparecem em mais de um fornecedor; por exemplo "LAFORT MALHAS INDUSTRIA E
+    COMERCIO LTDA" e "O MESMO" compartilham 75165399000160). Indexar
+    documento -> um unico codigo fazia o ultimo sobrescrever os demais, e todos
+    os titulos/produtos do fornecedor certo passavam a apontar para o cadastro
+    errado. O total financeiro continuava correto, mas o rateio por fornecedor
+    ficava trocado.
+
+    Por isso guardamos TODOS os candidatos por documento e por nome e
+    desempatamos assim:
+      1. documento + nome batendo (empate resolvido pelo nome);
+      2. documento, preferindo um cadastro Web ainda nao usado;
+      3. nome exato, tambem preferindo um cadastro ainda nao usado.
+    """
     fornecedores_giv = buscar_fornecedores_giv(cursor_giv, cd_empresa_giv)
     cursor_web.execute(
         f"""
@@ -3757,49 +3773,87 @@ def buscar_mapa_fornecedor_produto(cursor_giv, cursor_web, tabela_web_fornecedor
     )
     por_documento = {}
     por_nome = {}
+    nomes_do_web = {}
     for row in cursor_web.fetchall():
         cd_fornecedor = row[0]
-        documento = normalizar_cadastro_nacional(row[1])
-        if documento:
-            por_documento[documento] = cd_fornecedor
-        documento_digitos = somente_digitos(row[1])
-        if documento_digitos:
-            por_documento[documento_digitos] = cd_fornecedor
-        for nome in (row[2], row[3]):
-            chave = chave_nome_produto(nome)
-            if chave:
-                por_nome[chave] = cd_fornecedor
+        chaves_nome_web = {
+            chave_nome_produto(nome)
+            for nome in (row[2], row[3])
+            if chave_nome_produto(nome)
+        }
+        nomes_do_web[cd_fornecedor] = chaves_nome_web
+        for documento in (normalizar_cadastro_nacional(row[1]), somente_digitos(row[1])):
+            if documento:
+                por_documento.setdefault(documento, [])
+                if cd_fornecedor not in por_documento[documento]:
+                    por_documento[documento].append(cd_fornecedor)
+        for chave in chaves_nome_web:
+            por_nome.setdefault(chave, [])
+            if cd_fornecedor not in por_nome[chave]:
+                por_nome[chave].append(cd_fornecedor)
+
+    def escolher(candidatos, chaves_nome_giv, usados):
+        """Desempata candidatos preferindo nome igual e cadastro ainda livre."""
+        if not candidatos:
+            return None
+        por_nome_igual = [
+            cd for cd in candidatos
+            if nomes_do_web.get(cd, set()) & chaves_nome_giv
+        ]
+        for grupo in (por_nome_igual, candidatos):
+            if not grupo:
+                continue
+            livres = [cd for cd in grupo if cd not in usados]
+            if livres:
+                return livres[0]
+        return por_nome_igual[0] if por_nome_igual else candidatos[0]
 
     mapa = {}
+    usados = set()
+    ambiguos = 0
+    por_documento_ok = 0
+    por_nome_ok = 0
     for reg in fornecedores_giv:
-        documento = normalizar_cadastro_nacional(reg.get('cgc'))
-        documento_digitos = somente_digitos(reg.get('cgc'))
-        chaves_nome = [
+        chaves_nome_giv = {
             chave_nome_produto(nome)
             for nome in (
                 nome_fornecedor_origem(reg),
                 reg.get('nm_fornecedor'),
                 reg.get('razao_social'),
             )
-        ]
-        cd_fornecedor_web = None
-        if documento:
-            cd_fornecedor_web = por_documento.get(documento)
-        if cd_fornecedor_web is None and documento_digitos:
-            cd_fornecedor_web = por_documento.get(documento_digitos)
-        if cd_fornecedor_web is None:
-            for chave_nome in chaves_nome:
-                if chave_nome:
-                    cd_fornecedor_web = por_nome.get(chave_nome)
-                    if cd_fornecedor_web is not None:
-                        break
+            if chave_nome_produto(nome)
+        }
+        candidatos = []
+        for documento in (normalizar_cadastro_nacional(reg.get('cgc')), somente_digitos(reg.get('cgc'))):
+            if documento:
+                for cd in por_documento.get(documento, []):
+                    if cd not in candidatos:
+                        candidatos.append(cd)
+
+        origem_doc = bool(candidatos)
+        if not candidatos:
+            for chave_nome in chaves_nome_giv:
+                for cd in por_nome.get(chave_nome, []):
+                    if cd not in candidatos:
+                        candidatos.append(cd)
+
+        if len(candidatos) > 1:
+            ambiguos += 1
+        cd_fornecedor_web = escolher(candidatos, chaves_nome_giv, usados)
         if cd_fornecedor_web is not None:
+            usados.add(cd_fornecedor_web)
+            if origem_doc:
+                por_documento_ok += 1
+            else:
+                por_nome_ok += 1
             mapa[reg.get('cd_fornecedor')] = cd_fornecedor_web
             mapa[normalizar_codigo_cidade(reg.get('cd_fornecedor'))] = cd_fornecedor_web
 
     print(
-        f"[OK] Mapa fornecedor produto: {len(mapa)}/{len(fornecedores_giv)} "
-        "fornecedores GIV ligados ao Web por documento/nome."
+        f"[OK] Mapa fornecedor: {por_documento_ok + por_nome_ok}/{len(fornecedores_giv)} "
+        f"fornecedores GIV ligados ao Web ({por_documento_ok} por documento, "
+        f"{por_nome_ok} por nome; {ambiguos} tiveram mais de um candidato e foram "
+        "desempatados pelo nome)."
     )
     return mapa
 
@@ -5424,12 +5478,15 @@ def inserir_produto_filho_transacional(
     tabelas_web,
     produto,
     produto_filho,
+    precos,
     estoque,
     limites
 ):
     """Insere produto filho e seus dependentes dentro de um savepoint unico."""
     aplicar_limites_texto_registro(produto, limites.get('produto'))
     aplicar_limites_texto_registro(produto_filho, limites.get('produto_filho'))
+    for preco in precos:
+        aplicar_limites_texto_registro(preco, limites.get('produto_preco'))
     aplicar_limites_texto_registro(estoque, limites.get('produto_estoque'))
 
     cursor_web.execute("SAVEPOINT sp_produto_filho")
@@ -5439,6 +5496,9 @@ def inserir_produto_filho_transacional(
         inserir_registro_web_sem_savepoint(cursor_web, tabelas_web['produto'], produto)
         etapa = 'produto_filho'
         inserir_registro_web_sem_savepoint(cursor_web, tabelas_web['produto_filho'], produto_filho)
+        etapa = 'produto_preco'
+        for preco in precos:
+            inserir_registro_web_sem_savepoint(cursor_web, tabelas_web['produto_preco'], preco)
         etapa = 'produto_estoque'
         inserir_registro_web_sem_savepoint(cursor_web, tabelas_web['produto_estoque'], estoque)
         cursor_web.execute("RELEASE SAVEPOINT sp_produto_filho")
@@ -5465,6 +5525,8 @@ def preparar_item_produto_filho_para_insert(item, limites):
     """Aplica limites de texto nos registros de um produto filho antes do lote."""
     aplicar_limites_texto_registro(item['produto'], limites.get('produto'))
     aplicar_limites_texto_registro(item['produto_filho'], limites.get('produto_filho'))
+    for preco in item['precos']:
+        aplicar_limites_texto_registro(preco, limites.get('produto_preco'))
     aplicar_limites_texto_registro(item['estoque'], limites.get('produto_estoque'))
 
 
@@ -5607,6 +5669,14 @@ def inserir_produtos_filhos_lote_transacional(cursor_web, tabelas_web, itens, li
                 tabelas_web['produto_filho'],
                 [item['produto_filho'] for item in lote]
             )
+            precos = []
+            for item in lote:
+                precos.extend(item['precos'])
+            inserir_registros_multi_sem_savepoint(
+                cursor_web,
+                tabelas_web['produto_preco'],
+                precos
+            )
             inserir_registros_multi_sem_savepoint(
                 cursor_web,
                 tabelas_web['produto_estoque'],
@@ -5655,6 +5725,7 @@ def inserir_produtos_filhos_lote_transacional(cursor_web, tabelas_web, itens, li
                     tabelas_web,
                     item['produto'],
                     item['produto_filho'],
+                    item['precos'],
                     item['estoque'],
                     limites
                 )
@@ -6660,6 +6731,11 @@ def processar_produtos(
                 tenant_id,
                 cd_empresa
             )
+            precos = montar_precos_web(
+                precos_por_produto.get(cd_produto_giv, []),
+                cd_produto_web,
+                tenant_id
+            )
 
             if erros_validacao:
                 erros += 1
@@ -6697,6 +6773,7 @@ def processar_produtos(
                 'cd_produto_web': cd_produto_web,
                 'produto': produto,
                 'produto_filho': produto_filho,
+                'precos': precos,
                 'estoque': estoque,
             })
             agora = time.monotonic()
@@ -7787,6 +7864,11 @@ def cadastrar_produtos_faltantes_rotinas(
             'cd_produto_web': cd_produto_web,
             'produto': produto,
             'produto_filho': produto_filho,
+            'precos': montar_precos_web(
+                precos_por_produto.get(cd_produto_giv, []),
+                cd_produto_web,
+                tenant_id
+            ),
             'estoque': converter_produto_estoque(
                 estoques_por_produto.get(cd_produto_giv),
                 cd_produto_web,
@@ -9251,7 +9333,10 @@ def processar_prevenda_rotina(cursor_giv, cursor_web, tabelas_web, mapas, tenant
             'cd_usuario_liberou_desconto_maior': mapas['usuario'].get(prevenda.get('cd_usuario_desconto')),
             'vl_desconto': valor_decimal_ou_zero(prevenda.get('vl_desconto_total')),
             'vl_acrescimo_produto': vl_acrescimo_item,
-            'vl_acrescimo_financeiro': vl_acrescimo_total - vl_acrescimo_item,
+            # No GIV, vl_acrescimo_total e o acrescimo financeiro e
+            # vl_acrescimo_total_item e o acrescimo dos itens. Nao subtrair
+            # um do outro: o Web guarda os dois componentes separadamente.
+            'vl_acrescimo_financeiro': vl_acrescimo_total,
             'vl_total': valor_decimal_ou_zero(prevenda.get('vl_total')),
             'observacao': prevenda.get('obs'),
             'cd_usuario_caixa': cd_usuario,
@@ -9503,6 +9588,8 @@ def processar_condicionais_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
         qt_produto = valor_decimal_ou_zero(item.get('qt_cotada'))
         qt_faturado = valor_decimal_ou_zero(item.get('qt_atendida'))
         qt_devolvido = valor_decimal_ou_zero(item.get('qt_suspenso'))
+        vl_unitario = valor_decimal_ou_zero(item.get('vl_unitario'))
+        vl_custo = valor_decimal_ou_zero(item.get('vl_custo'))
         itens.append(limpar_registro({
             'nr_item': ordinal[nr_condicional_web],
             'nr_condicional': nr_condicional_web,
@@ -9516,6 +9603,16 @@ def processar_condicionais_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
             'cd_usuario_status': mapas['usuario'].get(item.get('cd_usuario_suspenso')),
             'dt_status': item.get('dt_suspenso'),
             'motivo_cancelamento': item.get('ds_motivo_suspenso') if status_item == 'C' or qt_devolvido else None,
+            'vl_unitario': vl_unitario,
+            'vl_custo_unitario': vl_custo,
+            'pr_margem_lucro': calcular_margem(vl_unitario, vl_custo),
+            'vl_desconto': valor_decimal_ou_zero(item.get('vl_desconto')),
+            'vl_acrescimo_produto': valor_decimal_ou_zero(item.get('vl_acrescimo')),
+            'vl_acrescimo_financeiro': Decimal('0'),
+            'id_produto_promocao': valor_flag(item.get('id_produto_promocao'), 'N'),
+            'vl_promocao': valor_decimal_ou_zero(item.get('vl_promocao')),
+            'cd_usuario_comissao': mapas['usuario'].get(item.get('cd_funcionario')),
+            'pr_comissao': valor_decimal_ou_zero(item.get('pr_comissao')),
         }))
 
     print(f"[OK] {len(itens)} itens de condicionais para inserir.")
@@ -9647,7 +9744,9 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
             'vl_frete': valor_decimal_ou_zero(nota.get('vl_frete')),
             'vl_desconto': valor_decimal_ou_zero(nota.get('vl_desconto_total')),
             'vl_acrescimo_produto': vl_acrescimo_item,
-            'vl_acrescimo_financeiro': vl_acrescimo - vl_acrescimo_item,
+            # O campo vl_acrescimo do GIV representa o componente financeiro;
+            # vl_acrescimo_total_item ja e o componente dos produtos.
+            'vl_acrescimo_financeiro': vl_acrescimo,
             'vl_outras_despesas': Decimal('0'),
             'vl_total': valor_decimal_ou_zero(nota.get('vl_total_nota')),
             'vl_base_substituicao': valor_decimal_ou_zero(nota.get('vl_base_icms_subst')),
@@ -11391,10 +11490,30 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
             'prevenda',
             'prevenda',
             tabelas_web.get('prevenda'),
-            [('qtd', 'count'), ('vl_total', 'decimal')],
-            f"SELECT COUNT(*), COALESCE(SUM(vl_total), 0) FROM prevenda WHERE cd_empresa = {cd_empresa_giv}",
+            [
+                ('qtd', 'count'),
+                ('vl_total', 'decimal'),
+                ('vl_desconto', 'decimal'),
+                ('vl_acrescimo_produto', 'decimal'),
+                ('vl_acrescimo_financeiro', 'decimal'),
+            ],
             f"""
-            SELECT COUNT(*), COALESCE(SUM(vl_total), 0)
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(vl_total), 0),
+                COALESCE(SUM(vl_desconto_total), 0),
+                COALESCE(SUM(vl_acrescimo_total_item), 0),
+                COALESCE(SUM(vl_acrescimo_total), 0)
+              FROM prevenda
+             WHERE cd_empresa = {cd_empresa_giv}
+            """,
+            f"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(vl_total), 0),
+                COALESCE(SUM(vl_desconto), 0),
+                COALESCE(SUM(vl_acrescimo_produto), 0),
+                COALESCE(SUM(vl_acrescimo_financeiro), 0)
               FROM {tabelas_web.get('prevenda')}
              WHERE tenant_id = %s AND cd_empresa = %s
             """,
@@ -11464,13 +11583,19 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
                 ('qt_produto', 'decimal'),
                 ('qt_faturado', 'decimal'),
                 ('qt_devolvido', 'decimal'),
+                ('vl_bruto_itens', 'decimal'),
+                ('vl_desconto_itens', 'decimal'),
+                ('vl_acrescimo_itens', 'decimal'),
             ],
             f"""
             SELECT
                 COUNT(*),
                 COALESCE(SUM(qt_cotada), 0),
                 COALESCE(SUM(qt_atendida), 0),
-                COALESCE(SUM(qt_suspenso), 0)
+                COALESCE(SUM(qt_suspenso), 0),
+                COALESCE(SUM(qt_cotada * vl_unitario), 0),
+                COALESCE(SUM(vl_desconto), 0),
+                COALESCE(SUM(vl_acrescimo), 0)
               FROM orcamento_item
              WHERE cd_empresa = {cd_empresa_giv}
             """,
@@ -11479,7 +11604,10 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
                 COUNT(*),
                 COALESCE(SUM(qt_produto), 0),
                 COALESCE(SUM(qt_faturado), 0),
-                COALESCE(SUM(qt_devolvido), 0)
+                COALESCE(SUM(qt_devolvido), 0),
+                COALESCE(SUM(qt_produto * vl_unitario), 0),
+                COALESCE(SUM(vl_desconto), 0),
+                COALESCE(SUM(vl_acrescimo_produto + vl_acrescimo_financeiro), 0)
               FROM {tabelas_web.get('condicional_item')}
              WHERE tenant_id = %s AND cd_empresa = %s
             """,
@@ -11492,10 +11620,30 @@ def comparar_totais_pos_conversao(cursor_giv, cursor_web, tabelas_selecionadas, 
             'nota_fiscal_saida',
             'nota_fiscal_saida',
             tabelas_web.get('nota_fiscal_saida'),
-            [('qtd', 'count'), ('vl_total', 'decimal')],
-            f"SELECT COUNT(*), COALESCE(SUM(vl_total_nota), 0) FROM nota_fiscal_saida WHERE cd_empresa = {cd_empresa_giv}",
+            [
+                ('qtd', 'count'),
+                ('vl_total', 'decimal'),
+                ('vl_desconto', 'decimal'),
+                ('vl_acrescimo_produto', 'decimal'),
+                ('vl_acrescimo_financeiro', 'decimal'),
+            ],
             f"""
-            SELECT COUNT(*), COALESCE(SUM(vl_total), 0)
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(vl_total_nota), 0),
+                COALESCE(SUM(vl_desconto_total), 0),
+                COALESCE(SUM(vl_acrescimo_total_item), 0),
+                COALESCE(SUM(vl_acrescimo), 0)
+              FROM nota_fiscal_saida
+             WHERE cd_empresa = {cd_empresa_giv}
+            """,
+            f"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(vl_total), 0),
+                COALESCE(SUM(vl_desconto), 0),
+                COALESCE(SUM(vl_acrescimo_produto), 0),
+                COALESCE(SUM(vl_acrescimo_financeiro), 0)
               FROM {tabelas_web.get('nota_fiscal_saida')}
              WHERE tenant_id = %s AND cd_empresa = %s
             """,
