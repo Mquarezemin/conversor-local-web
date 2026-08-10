@@ -177,6 +177,7 @@ TABELAS_DISPONIVEIS = (
     "titulo_pagar",
     "caixa_movimentacao",
     "movimento_bancario",
+    "cliente_movto_credito",
 )
 DEPENDENCIAS_PROCESSAMENTO = {
     "sub_grupo": ("grupo",),
@@ -205,6 +206,7 @@ DEPENDENCIAS_PROCESSAMENTO = {
     "movimento_estoque": ("operacao_estoque", "produto", "usuario"),
     "caixa_movimentacao": ("cliente", "usuario"),
     "movimento_bancario": ("cliente", "fornecedor", "usuario", "banco_conta", "titulo_receber", "titulo_pagar"),
+    "cliente_movto_credito": ("cliente", "produto"),
 }
 ROTINAS_COM_PRODUTO = {
     "condicional",
@@ -212,6 +214,7 @@ ROTINAS_COM_PRODUTO = {
     "nota_fiscal_entrada",
     "prevenda",
     "nota_fiscal_saida",
+    "cliente_movto_credito",
 }
 NOMES_TABELAS_LOG = {
     "grupo": "grupo",
@@ -242,6 +245,7 @@ NOMES_TABELAS_LOG = {
     "titulo_pagar": "titulo_pagar",
     "caixa_movimentacao": "caixa_movimentacao",
     "movimento_bancario": "movimento_bancario",
+    "cliente_movto_credito": "cliente_movto_credito (historico)",
 }
 
 
@@ -1024,6 +1028,190 @@ def buscar_registros_giv(cursor_giv, sql, params=None, limite=None):
         if limite is not None and len(resultados) >= limite:
             break
     return resultados
+
+
+def buscar_movimentos_credito_cliente_giv(cursor_giv, cd_empresa_giv=None):
+    """Le o razao de credito/devolucao do GIV sem reduzir as linhas a um saldo."""
+    where_sql, params = filtro_empresa_giv(
+        cursor_giv,
+        'cliente_movto_credito',
+        'cmc',
+        cd_empresa_giv
+    )
+    sql = """
+        SELECT
+            cmc.nr_movto,
+            cmc.cd_empresa,
+            cmc.cd_cliente,
+            cmc.dt_movto,
+            cmc.vl_movto,
+            cmc.obs,
+            cmc.complemento,
+            cmc.obs_devolucao,
+            cmc.cd_produto,
+            cmc.qt_produto,
+            cmc.id_operacao,
+            cmc.nr_devolucao,
+            cmc.vl_custo
+        FROM cliente_movto_credito cmc
+        {where_sql}
+        ORDER BY cmc.cd_empresa, cmc.cd_cliente, cmc.nr_movto
+    """.format(where_sql=where_sql)
+    return buscar_registros_giv(cursor_giv, sql, params if params else None)
+
+
+def classificar_movimento_credito_historico(registro):
+    """Mantem C/D do GIV e qualifica ajustes/estornos quando descritos no historico."""
+    direcao = str(registro.get('id_operacao') or '').strip().upper()
+    if direcao not in ('C', 'D'):
+        raise ValueError(f"Operacao de credito GIV invalida: {direcao or '<vazia>'}")
+
+    observacao = ' '.join(
+        str(registro.get(campo) or '')
+        for campo in ('obs', 'complemento', 'obs_devolucao')
+    ).upper()
+    if 'ESTORN' in observacao:
+        tipo = 'ESTORNO_DEBITO' if direcao == 'C' else 'ESTORNO_CREDITO'
+    elif 'AJUST' in observacao:
+        tipo = 'AJUSTE_CREDITO' if direcao == 'C' else 'AJUSTE_DEBITO'
+    else:
+        tipo = 'CREDITO' if direcao == 'C' else 'DEBITO'
+    return tipo, direcao
+
+
+def processar_movimentos_credito_cliente_historico(
+    cursor_giv,
+    cursor_web,
+    tabela_web_credito_historico,
+    mapas,
+    tenant_id,
+    cd_empresa_web,
+    cd_empresa_giv=None
+):
+    """
+    Converte cliente_movto_credito para o razao historico append-only do Web.
+    nr_movto e a chave idempotente e a sequencia do GIV; C/D nunca sao
+    compactados, pois debitacoes, ajustes e estornos precisam permanecer
+    auditaveis individualmente.
+    """
+    movimentos = buscar_movimentos_credito_cliente_giv(cursor_giv, cd_empresa_giv)
+    inseridos = existentes = erros = 0
+    erros_detalhe = []
+    avisos = []
+    mapa_clientes = mapas.get('cliente', {})
+    mapa_produtos = mapas.get('produto', {})
+
+    for movimento in movimentos:
+        try:
+            nr_movto = int(movimento.get('nr_movto'))
+            cd_empresa_origem = int(movimento.get('cd_empresa'))
+            cd_cliente_origem = movimento.get('cd_cliente')
+            cd_cliente_web = (
+                mapa_clientes.get((cd_empresa_origem, cd_cliente_origem))
+                or mapa_clientes.get(cd_cliente_origem)
+                or mapa_clientes.get(normalizar_codigo_cidade(cd_cliente_origem))
+            )
+            if not cd_cliente_web:
+                raise ValueError(f"cliente GIV {cd_cliente_origem} sem mapa no Web")
+
+            tipo, direcao = classificar_movimento_credito_historico(movimento)
+            valor = valor_decimal_ou_zero(movimento.get('vl_movto'))
+            if valor <= 0:
+                raise ValueError(f"valor invalido {valor}")
+            dt_movimento = movimento.get('dt_movto')
+            if not dt_movimento:
+                raise ValueError("data de movimento ausente")
+
+            cd_produto_origem = movimento.get('cd_produto')
+            cd_produto_web = None
+            if cd_produto_origem is not None:
+                cd_produto_web = (
+                    mapa_produtos.get(cd_produto_origem)
+                    or mapa_produtos.get(normalizar_codigo_cidade(cd_produto_origem))
+                )
+                if not cd_produto_web:
+                    avisos.append(
+                        f"nr_movto={nr_movto}: produto GIV {cd_produto_origem} sem mapa; movimento sera preservado sem produto."
+                    )
+
+            chave_origem = f"GIV:{cd_empresa_origem}:{nr_movto}"
+            cursor_web.execute(
+                f"""
+                SELECT id_movimento
+                FROM {tabela_web_credito_historico}
+                WHERE tenant_id = %s AND origem = 'GIV' AND chave_origem = %s
+                LIMIT 1
+                """,
+                (tenant_id, chave_origem)
+            )
+            if cursor_web.fetchone():
+                existentes += 1
+                continue
+
+            cursor_web.execute(
+                f"""
+                SELECT sequencia_origem, saldo_posterior
+                FROM {tabela_web_credito_historico}
+                WHERE tenant_id = %s
+                  AND origem = 'GIV'
+                  AND cd_empresa = %s
+                  AND cd_cliente = %s
+                ORDER BY sequencia_origem DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (tenant_id, cd_empresa_web, cd_cliente_web)
+            )
+            saldo_atual = cursor_web.fetchone()
+            if saldo_atual and nr_movto <= int(saldo_atual[0]):
+                raise ValueError(f"sequencia fora de ordem; ultimo nr_movto importado={saldo_atual[0]}")
+            saldo_anterior = valor_decimal_ou_zero(saldo_atual[1] if saldo_atual else 0)
+            saldo_posterior = saldo_anterior + valor if direcao == 'C' else saldo_anterior - valor
+            observacao = ' | '.join(
+                str(movimento.get(campo) or '').strip()
+                for campo in ('obs', 'complemento', 'obs_devolucao')
+                if str(movimento.get(campo) or '').strip()
+            )[:500] or None
+            quantidade = valor_decimal_ou_zero(movimento.get('qt_produto')) if movimento.get('qt_produto') is not None else None
+            if quantidade is not None and quantidade <= 0:
+                quantidade = None
+
+            cursor_web.execute(
+                f"""
+                INSERT INTO {tabela_web_credito_historico} (
+                    tenant_id, cd_empresa, cd_cliente, cd_produto, nr_devolucao_origem,
+                    origem, chave_origem, sequencia_origem, tipo, direcao, valor,
+                    quantidade, vl_custo_unitario, saldo_anterior, saldo_posterior,
+                    observacao, dt_movimento
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    'GIV', %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    tenant_id, cd_empresa_web, cd_cliente_web, cd_produto_web,
+                    movimento.get('nr_devolucao'), chave_origem, nr_movto, tipo, direcao, valor,
+                    quantidade,
+                    valor_decimal_ou_zero(movimento.get('vl_custo')) if movimento.get('vl_custo') is not None else None,
+                    saldo_anterior, saldo_posterior, observacao, dt_movimento
+                )
+            )
+            inseridos += 1
+        except Exception as exc:
+            erros += 1
+            if len(erros_detalhe) < 25:
+                erros_detalhe.append(f"nr_movto={movimento.get('nr_movto')}: {exc}")
+
+    return {
+        'tabela': 'cliente_movto_credito (historico)',
+        'lidos': len(movimentos),
+        'inseridos': inseridos,
+        'existentes': existentes,
+        'erros': erros,
+        'erros_detalhe': erros_detalhe,
+        'avisos': avisos[:25],
+    }
 
 
 _GIV_COLUNA_CACHE = {}
@@ -15013,6 +15201,10 @@ def solicitar_tabelas_para_converter():
         'movimento_bancario': 'movimento_bancario',
         'banco_movto': 'movimento_bancario',
         'movimentos_bancarios': 'movimento_bancario',
+        '30': 'cliente_movto_credito',
+        'cliente_movto_credito': 'cliente_movto_credito',
+        'credito_cliente': 'cliente_movto_credito',
+        'creditos_devolucoes': 'cliente_movto_credito',
     }
 
     print("Quais tabelas deseja converter?")
@@ -15047,11 +15239,12 @@ def solicitar_tabelas_para_converter():
     print("  22 - titulo_pagar -> titulo_pagar/historico")
     print("  28 - caixa_movto -> caixa_movimentacao (historico)")
     print("  29 - banco_movto -> movimentos bancarios dos titulos")
+    print("  30 - cliente_movto_credito -> razao historico de creditos/devolucoes")
     print("  T - todas na ordem segura")
     print("Voce pode informar mais de uma opcao, exemplo: 2,9,8,6,11,14,21")
 
     while True:
-        resposta = input("Tabelas [T/0..29]: ").strip().lower()
+        resposta = input("Tabelas [T/0..30]: ").strip().lower()
         if not resposta or resposta in ('t', 'todas', 'todos', 'all'):
             return list(TABELAS_DISPONIVEIS)
 
@@ -15081,7 +15274,7 @@ def solicitar_tabelas_para_converter():
         if selecionadas and not invalidas:
             return [tabela for tabela in TABELAS_DISPONIVEIS if tabela in selecionadas]
 
-        print("Opcao invalida. Use T, 0..29 ou uma lista como 2,9,8,6,11,14,21.")
+        print("Opcao invalida. Use T, 0..30 ou uma lista como 2,9,8,6,11,14,21.")
 
 
 def solicitar_tenant_id():
@@ -15296,17 +15489,19 @@ def main():
             'caixa_movimentacao',
             'movimento_bancario',
         }.intersection(tabelas_selecionadas)
+        historico_credito_selecionado = 'cliente_movto_credito' in tabelas_selecionadas
         historico_estoque_selecionado = bool({
             'operacao_estoque',
             'movimento_estoque',
         }.intersection(tabelas_selecionadas))
         precisa_mapas_rotinas = bool(
-            rotinas_documento_selecionadas or historico_financeiro_selecionado
+            rotinas_documento_selecionadas or historico_financeiro_selecionado or historico_credito_selecionado
         )
         precisa_produto_completo = (
             'produto' in tabelas_selecionadas
             or bool(ROTINAS_COM_PRODUTO.intersection(tabelas_selecionadas))
             or 'movimento_estoque' in tabelas_selecionadas
+            or historico_credito_selecionado
         )
         if precisa_mapas_rotinas:
             precisa_auxiliares_produto = True
@@ -15510,6 +15705,18 @@ def main():
                     f"{tabelas_web_rotinas['titulo_receber_movimento_bancario']}, "
                     f"{tabelas_web_rotinas['titulo_pagar_movimento_bancario']}"
                 )
+            if historico_credito_selecionado:
+                tabela_credito_historico = resolver_tabela_web_opcional(
+                    cursor_web,
+                    "cliente_credito_historico_movimento"
+                )
+                if not tabela_credito_historico:
+                    raise RuntimeError(
+                        "A tabela cliente_credito_historico_movimento ainda nao existe no Web. "
+                        "Aplique a migration 20260810120000_add_credito_historico_importacao antes da carga."
+                    )
+                tabelas_web_rotinas['cliente_credito_historico_movimento'] = tabela_credito_historico
+                print(f"[OK] Tabela Web de credito historico: {tabela_credito_historico}")
             print("[OK] Tabelas Web das rotinas/documentos resolvidas.")
 
         tabelas_web_reversao = {
@@ -16114,6 +16321,18 @@ def main():
                 cursor_giv,
                 cursor_web,
                 tabelas_web_rotinas,
+                mapas_rotinas,
+                tenant_id,
+                cd_empresa,
+                cd_empresa_giv_filtro
+            ))
+
+        if 'cliente_movto_credito' in tabelas_selecionadas:
+            gui_progress_tabela('cliente_movto_credito')
+            resumos.append(processar_movimentos_credito_cliente_historico(
+                cursor_giv,
+                cursor_web,
+                tabelas_web_rotinas['cliente_credito_historico_movimento'],
                 mapas_rotinas,
                 tenant_id,
                 cd_empresa,

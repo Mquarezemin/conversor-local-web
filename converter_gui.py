@@ -139,6 +139,7 @@ TABLE_OPTIONS = [
     ("22", "titulo_pagar", "titulo_pagar"),
     ("28", "caixa_movimentacao", "caixa_movto -> caixa_movimentacao (historico)"),
     ("29", "movimento_bancario", "banco_movto -> movimentos bancarios dos titulos"),
+    ("30", "cliente_movto_credito", "cliente_movto_credito -> razao de creditos/devolucoes"),
 ]
 
 TABLE_ORDER = {key: idx for idx, (_number, key, _label) in enumerate(TABLE_OPTIONS)}
@@ -177,6 +178,7 @@ DEPENDENCIES = {
         "titulo_receber",
         "titulo_pagar",
     ),
+    "cliente_movto_credito": ("cliente", "produto"),
 }
 
 REVERTER_DEPENDENTS = {}
@@ -305,6 +307,7 @@ PROGRESS_KEYWORDS = [
     ("colecao", ("colecao", "colecoes")),
     ("grade", ("grade", "grades")),
     ("prevenda", ("prevenda", "prevendas")),
+    ("cliente_movto_credito", ("cliente_movto_credito", "credito historico", "creditos/devolucoes")),
     ("empresa", ("empresa giv", "criando tenant", "criacao de empresa")),
 ]
 
