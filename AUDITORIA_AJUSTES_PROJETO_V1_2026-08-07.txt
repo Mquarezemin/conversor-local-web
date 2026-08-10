@@ -1,13 +1,36 @@
 AUDITORIA GIV -> WEB - AJUSTES NECESSARIOS NO projeto_v1
-Data da auditoria: 07/08/2026
+Data da auditoria: 08/08/2026
 Escopo: tenant_id=8, cd_empresa Web=7, cd_empresa GIV=1.
 
 IMPORTANTE
 ----------
 Nenhum arquivo do projeto_v1 foi alterado nesta auditoria.
 Este arquivo e somente um roteiro tecnico para os ajustes posteriores.
-O projeto_v1 ja possuia alteracoes locais anteriores nas rotinas de saldo de estoque;
-elas foram preservadas.
+O estado do projeto_v1 foi preservado integralmente.
+
+RESUMO EXECUTIVO DO ESTADO ATUAL
+--------------------------------
+OK NO BANCO: documentos, itens, titulos, valores de cabecalho e contas a
+receber/contas a pagar conferidos no escopo possuem correspondencia GIV/Web.
+
+CARGA HISTORICA EFETIVADA: as opcoes 26,27,28,29 foram executadas com commit no
+tenant atual. Foram gravados 60.645 movimentos GIV de estoque, 10.512
+movimentos de caixa e 6.391 grupos de movimentos bancarios vinculados, sem
+duplicidade nas chaves de origem. Os valores foram conferidos depois do commit.
+
+PENDENCIA DE MODELAGEM: 1.767 movimentos bancarios diretos/sem de-para,
+creditos/devolucoes e credito de fornecedor continuam sem tabela Web
+equivalente segura. O historico carregado agora alimenta as consultas, mas
+rankings, giro, saldo historico, extrato e demonstrativo ainda dependem das
+regras/fontes do projeto_v1 e dos fatos que nao possuem modelo equivalente.
+ESCOPO EXCLUIDO POR DECISAO DO USUARIO: caixa_status/caixa_fechamento nao sera
+avaliado nesta auditoria e nao sera usado para exigir paridade dos relatorios.
+Os movimentos bancarios vinculados e os historicos de caixa/estoque ja foram
+carregados; os fatos sem modelo continuam impedindo paridade total dos
+relatorios que dependem deles.
+
+PENDENCIA DE PROJETO_V1: existem ajustes de filtro/calculo/tela descritos ao
+final deste arquivo. Nenhum deles foi aplicado no projeto_v1.
 
 1. CONCLUSAO DOS ITENS DA NOTA FISCAL DE SAIDA
 -----------------------------------------------
@@ -60,22 +83,52 @@ Ajustes em obterPorId(), aproximadamente linhas 952-1023:
 
    Nao usar somente qt_produto * vl_unitario.
 
-3) Corrigir o nome do produto para produtos filhos.
-   Hoje obterPorId() consulta somente produto.produto_info diretamente.
-   Os produtos filhos importados ficam em produto_filho e o nome fica no
-   produto_info do produto pai. Fazer fallback:
+3) Nome do produto: o codigo atual do projeto_v1 ja possui o fallback correto
+   em descricaoPorVariacao(), tanto no relatorio analitico quanto no modal:
 
    produto direto -> produto_filho.cd_produto_pai -> produto_info do pai.
 
-   Se ainda nao houver nome, exibir um texto neutro com o codigo do produto.
-   Nao usar item.observacao como nome do produto.
+   Portanto, nao repetir esse ajuste. Se a tela ainda mostrar "3" ou ficar
+   vazia, validar se a API/servico em execucao esta com essa versao do codigo
+   e se o endpoint realmente chama descricaoPorVariacao(). Nao usar
+   item.observacao como nome do produto.
 
-   No caso da NF 1602, o texto "3" exibido na coluna Produto veio do campo de
-   observacao/complemento da origem; nao e o nome real dos cinco produtos.
+   No banco Web atual, os itens das NF 1602, 3164 e 3161 possuem o produto
+   filho e a descricao no produto pai. Isso confirma que nao houve perda do
+   cadastro na conversao; o problema de nome apresentado na tela e de
+   versao/consulta da aplicacao se ainda aparecer.
 
-Ajuste adicional no relatorio analitico, aproximadamente linhas 482-503:
-o codigo de produtoNome tambem consulta somente produto_info direto. Aplicar
-o mesmo fallback de produto filho para produto pai nessa rotina.
+O mesmo cuidado vale para o detalhamento de notas fiscais de entrada. Foi
+confirmado no banco um caso concreto:
+
+- NF de entrada 543, serie 1:
+  bruto dos itens = R$ 6.900,00
+  descontos dos itens = R$ 6.680,00
+  total da nota = R$ 220,00
+
+O conversor preservou os quatro itens, seus valores unitarios e descontos. No
+arquivo entradaNotaRepository.ts, a montagem do detalhe ainda retorna
+`vl_total = qt_produto * vl_unitario`, sem descontar `vl_desconto` nem somar os
+demais componentes do item. O detalhe de entrada deve reutilizar a formula
+financeira do GIV, para nao exibir R$ 6.900,00 quando o total liquido da nota e
+R$ 220,00:
+
+  Round(Round(qt_produto * vl_unitario, 2) - vl_desconto
+        + vl_substituicao + vl_ipi
+        + frete quando nota.id_soma_frete_total_nota = 'S'
+        + vl_outras_despesas, 2)
+
+No escopo desta carga vl_substituicao e zero e o schema Web atual nao possui
+esse campo no item; mesmo assim a regra deve ficar documentada para nao
+perder o componente se o schema for ampliado.
+
+Arquivo envolvido:
+
+C:\Users\conversao01\Desktop\projeto_v1\src\adapters\outbound\repositories\entradaNotaRepository.ts
+
+O SQL atual de buscarNotaPorId() ja resolve produto direto, filho e pai. Nao ha
+ajuste de nome pendente nessa rotina; testar apenas a versao publicada caso a
+tela ainda fique sem descricao.
 
 2. CONTAS A PAGAR - DIFERENCA DO DASHBOARD
 ------------------------------------------
@@ -90,12 +143,44 @@ O titulo abaixo existe corretamente no Web e no GIV:
 Os numeros conferem exatamente:
 
   dashboard Web: R$ 446.274,34
-  lista GIV/Web com data final 01/01/2000: R$ 444.785,68
+  lista GIV/Web considerando somente vencimentos desde 01/01/2000:
+  R$ 444.785,68
   diferenca: R$ 1.488,66
 
 Ou seja, o dashboard inclui o titulo de 1818 porque busca todos os titulos
-abertos sem limite de data. A tela/lista, quando recebe data final 01/01/2000,
-exclui esse vencimento antigo.
+abertos sem limite inferior de data. A tela/lista operacional desconsidera
+vencimentos anteriores a 01/01/2000, por isso o titulo de 1818 fica fora e a
+diferenca e exatamente R$ 1.488,66.
+
+A conferencia visual confirmou o mesmo registro na tela:
+
+  documento exibido: 6869 / 3
+  fornecedor: MARACUJA
+  vencimento exibido: 17/05/1818
+  valor em aberto exibido: R$ 1.488,66
+
+Nova consulta direta apos essa conferencia confirmou que nao ha outro titulo
+aberto anterior a 01/01/2000 no tenant 8/empresa 7:
+
+  anteriores a 01/01/2000: 1 titulo, R$ 1.488,66 (somente 6869/3)
+  desde 01/01/2000: 251 titulos, R$ 444.785,68
+  todos os abertos: 252 titulos, R$ 446.274,34
+
+Revalidacao dos indicadores de atraso:
+
+  contas a pagar vencidas: GIV e Web = 77 titulos, R$ 165.833,20;
+  contas a receber em aberto: GIV e Web = 187 titulos, R$ 236.563,21;
+  contas a receber vencidas: GIV e Web = 102 titulos, R$ 133.608,11.
+
+Portanto, o valor geral do dashboard esta correto para a regra de incluir todos
+os titulos abertos. O erro e a falta de uma regra unica para a data invalida:
+o dashboard inclui 1818, enquanto a lista usada na conferencia exclui esse
+registro ao considerar apenas datas desde 01/01/2000. Isso deve ser resolvido
+na regra de filtro/normalizacao do projeto_v1, nao na importacao do titulo.
+
+O GIV e o Web tambem conferem o mesmo valor, vencimento, serie e parcela para
+6869/3. Portanto, a conversao preservou o dado; o erro e a regra diferente
+entre a consulta do dashboard e o filtro operacional.
 
 Arquivos envolvidos:
 
@@ -105,8 +190,9 @@ C:\Users\conversao01\Desktop\projeto_v1\src\application\services\DashboardDataSe
 O que ajustar:
 
 1) Definir uma regra unica para datas invalidas/historicas fora do periodo do
-   sistema. Exemplo: considerar datas anteriores a 01/01/1900 como invalidas,
-   ou exigir um periodo minimo valido para os widgets.
+   sistema. Para reproduzir o total conferido, o candidato e considerar
+   vencimentos anteriores a 01/01/2000 fora do total operacional, ou exibi-los
+   em uma categoria separada de datas invalidas.
 
 2) Aplicar a mesma regra no relatorio e no dashboard. Hoje o dashboard chama
    relatorioContasPagar() com situacao="aberto" e sem dtFim, aproximadamente
@@ -133,22 +219,63 @@ Os dados dos documentos e itens foram convertidos sem perda referencial:
 - contas a receber: GIV 23.751 / Web 23.751
 - contas a pagar: GIV 13.032 / Web 13.032
 
+Valores agregados conferidos no mesmo escopo:
+
+- pedido de compra: 177 documentos, R$ 889.703,71;
+- entrada: 2.653 notas, R$ 10.605.163,70 de nota e R$ 10.874.810,89 de
+  produto;
+- prevenda: 7.029 documentos, R$ 12.673.553,93;
+- condicional: 9.398 documentos, R$ 29.696.643,51;
+- saida: 13.237 notas, R$ 23.031.705,62;
+- contas a receber em aberto: R$ 236.563,21;
+- contas a pagar em aberto: R$ 446.274,34.
+
+Esses valores de cabecalho e financeiro bateram entre GIV e Web. As formulas
+especificas de cada relatorio ainda precisam respeitar os filtros e as
+devolucoes historicas descritas adiante.
+
 Para o filtro de CFOP usado na tela (5202, 5117, 5152, 5405, 5922, 5933,
-6102, 6108, 6117, 6152, 6405, 6922 e 6933), GIV e Web apresentaram:
+6102, 6108, 6117, 6152, 6405, 6922 e 6933), a comparacao direta dos itens
+confirmou que a carga preservou os dados:
 
-- 593 itens
-- quantidade 603
-- valor de produto R$ 179.107,8292
-- valor da nota R$ 182.023,83
+- incluindo notas canceladas: GIV e Web = 593 itens, quantidade 603 e valor
+  de produto R$ 179.107,8292;
+- excluindo notas canceladas: GIV e Web = 470 itens, quantidade 480 e valor
+  de produto R$ 147.369,3092.
 
-Portanto, a divergencia visual dos itens nao e causada pela carga dos itens.
+A divergencia visual, portanto, nao e causada por perda ou troca dos itens.
 
 Foi encontrada uma diferenca de regra entre o procedimento antigo do GIV e o
 relatorio sintetico do Web:
 
 - o sintetico do projeto_v1 usa diretamente nota_fiscal_saida.vl_total;
-- o procedimento GIV pr_rel_nota_fiscal_saida aplica filtros de situacao,
-  CF/ECF, serie, D1, CFOP e cancelamentos.
+- o procedimento GIV pr_rel_nota_fiscal_saida calcula o valor a partir dos
+  itens e aplica filtros de situacao, CF/ECF, serie, D1, CFOP e cancelamentos;
+- na base atual, sem canceladas e sem filtro de CFOP, o procedimento GIV
+  retornou 40.728 linhas de item, quantidade 41.214, produto
+  R$ 22.325.208,62 e valor de nota R$ 22.338.439,81;
+- na mesma base, o sintetico Web retornou 13.076 cabecalhos e soma
+  R$ 22.567.644,40, que e exatamente a soma dos cabecalhos nao cancelados.
+
+Revalidacao live da propria procedure GIV, executada com empresa 1, periodo
+01/01/1900 a 31/12/2099, pessoa T, tipo S, sem canceladas, todas as situacoes
+NFE habilitadas, D1 habilitado e sem lista de CFOP, retornou novamente 40.728
+linhas e 13.045 documentos distintos, com os mesmos valores acima. A consulta
+Web equivalente, sem canceladas, retornou 13.076 documentos. Portanto, a
+divergencia numerica nao e estimativa: vem da regra de selecao/calculo dos dois
+relatorios.
+
+Os itens selecionados por CFOP tambem ficaram com uma diferenca de regra:
+o procedimento GIV aplica a lista de natureza no cabecalho
+nota_fiscal_saida.cd_natureza, enquanto o Web usa a existencia de item com
+nota_fiscal_saida_item.cd_cfop. Isso precisa ser definido antes de dizer que
+os dois filtros sao equivalentes. Com a lista exibida na tela
+5202, 5117, 5152, 5405, 5922, 5933, 6102, 6108, 6117, 6152, 6405, 6922 e
+6933, a procedure GIV retornou 407 linhas, 34 documentos, quantidade 416,
+produto R$ 117.793,62 e nota R$ 120.709,62. A consulta Web por existencia de
+item nesses CFOPs retornou 51 documentos nao cancelados e R$ 164.596,89. Esse
+recorte confirma a diferenca de semantica do filtro, alem da diferenca geral de
+formula e situacao.
 
 Se a exigencia for igualdade absoluta com o relatorio antigo do GIV, alinhar no
 projeto_v1 os filtros e a formula do procedimento, especialmente:
@@ -160,61 +287,1329 @@ projeto_v1 os filtros e a formula do procedimento, especialmente:
 - calculo do valor por item com desconto, acrescimos, frete, IPI,
   substituicao e outras despesas.
 
-O relatorio analitico ja possui itemValues() com a formula detalhada; o modal
-de detalhe precisa reutilizar a mesma regra.
+O relatorio analitico ja possui itemValues() com a formula detalhada e ja usa
+o fallback de descricao dos produtos filhos. O modal de detalhe ainda calcula
+`vl_total` como bruto e precisa reutilizar a mesma regra financeira.
 
-4. PRODUTOS, PRECOS E ESTOQUE
+Uma revalidacao adicional por documento e por tupla numerica confirmou que os
+itens nao foram trocados durante a conversao:
+
+- pedido de compra: 1.949 itens, sem diferenca de quantidade/valores;
+- entrada: 33.150 itens, sem diferenca de quantidade/valores;
+- saida: 41.836 itens, sem diferenca de quantidade/valores;
+- prevenda: 20.153 itens, sem diferenca de quantidade/valores;
+- condicional: 66.908 itens, sem diferenca de quantidade/valores;
+- cabecalhos dos cinco tipos de documento: mesmas quantidades e mesmos
+  valores no GIV e no Web.
+
+Tambem foram conferidos os vinculos: nao existem itens sem cabecalho ou sem
+produto no Web, e as chaves unicas de itens nao possuem duplicidade.
+
+4. VALIDACAO DE DOCUMENTOS, ITENS E TITULOS
+--------------------------------------------
+Foi feita uma segunda conferencia, por chave de negocio e por agrupamento do
+documento, para evitar que totais iguais escondessem itens trocados:
+
+- pedido_compra: 177 chaves iguais; 1.949 itens; diferenca de quantidade e
+  valor por pedido = zero;
+- nota_fiscal_entrada: 2.653 chaves iguais; 33.150 itens; diferenca de
+  quantidade e valor por nota = zero;
+- prevenda: 7.029 chaves iguais; 20.153 itens; diferenca = zero;
+- condicional: 9.398 assinaturas naturais iguais; 66.908 itens; diferenca = zero;
+- nota_fiscal_saida: 13.237 chaves iguais; 41.836 itens; diferenca = zero;
+- titulo_receber: 23.751 chaves, com valor, vencimento e status equivalentes;
+- titulo_pagar: 13.032 titulos; as 335 chaves naturais repetidas existem nos
+  dois bancos e foram comparadas como multiconjunto; valor, vencimento e
+  status equivalentes apos o mapeamento GIV B/BA -> Web A.
+
+Na distribuicao de status do contas a receber, o GIV possui 717 titulos NG
+(negociados). O conversor mapeia NG para C no Web e acrescenta a observacao
+NEGOCIADO NO GIV; por isso o Web tem 2.842 cancelados, correspondentes aos
+2.125 CA + 717 NG do GIV. Esses titulos ficam fora do filtro de aberto, e os
+totais em aberto continuam iguais: 187 titulos, R$ 236.563,21.
+
+Rodada inicial dos testes de relatorio: 26 testes passaram e 1 falhou. A falha
+esta em
+tituloReceberRepository.relatorio.test.ts, que esperava a lista de status
+ignorados sem NG, embora o codigo atual inclua NG em statusIgnoradosPadrao.
+Isso e uma inconsistenca do teste/regra documentada, nao uma diferenca
+encontrada nos dados convertidos. O teste deve ser alinhado com a decisao de
+negociado = fora de aberto; nenhum arquivo do projeto_v1 foi alterado.
+
+Atualizacao da rodada completa: foram executadas 15 suites e 89 testes de
+relatorio, com 87 aprovados e 2 falhas. Alem da expectativa de status NG acima,
+a segunda falha esta em test/movimentoEstoqueObservacaoRelatorios.test.ts: o
+fixture mocka movimento_estoque, mas nao fornece os mocks produto_info e
+produto_filho que o repositorio consulta para resolver produto filho/pai. As
+duas falhas sao de teste/fixture; nenhum arquivo do projeto_v1 foi alterado.
+
+Reexecucao direcionada posterior das rotas de relatorio executou 9 suites e 42
+testes: 40 passaram e as mesmas 2 falhas foram reproduzidas. A tentativa da
+suíte completa foi encerrada pelo limite de 180 segundos sem conclusao; isso
+nao foi tratado como aprovacao nem como falha de conversao. O git status do
+projeto_v1 permaneceu limpo depois das execucoes.
+
+Conclusao desta etapa: a conversao de cabecalhos, itens e titulos esta
+consistente no banco. As diferencas observadas nas telas de itens, NF de
+saida e dashboard sao regras de consulta/calculo da aplicacao, nao perda de
+linhas na importacao.
+
+5. HISTORICOS E LACUNAS DOS RELATORIOS
+-----------------------------------------------
+Foi encontrado um ponto separado dos totais de notas e titulos: alguns
+movimentos historicos que alimentam os relatorios do GIV ainda nao possuem
+equivalente completo no Web. Os historicos de estoque, caixa e movimentos
+bancarios vinculados ja foram carregados; creditos/devolucoes, credito de
+fornecedor e movimentos bancarios diretos continuam sem modelo equivalente.
+Portanto, os totais de documentos podem bater e, ainda assim, os relatorios
+historicos nao baterem.
+
+5.1 DEVOLUCOES E CREDITOS
+-------------------------
+
+No GIV, a tabela cliente_movto_credito possui, para cd_empresa=1:
+
+- 1.471 movimentos entre 30/04/2020 e 04/08/2026;
+- quantidade total 773;
+- valor movimentado R$ 1.189.494,31.
+
+Por operacao, sao 831 movimentos C (R$ 612.135,21) e 640 movimentos D
+(R$ 577.359,10). Dos 1.471 movimentos, 1.078 possuem nr_devolucao e 765
+possuem cd_produto. Isso confirma que nao e seguro transformar cada linha em
+um simples credito: o modelo Web exige uma devolucao/credito pai, saldos
+anterior/posterior e um tipo de movimento permitido pelo schema.
+
+O detalhamento comprova a mistura de eventos: com nr_devolucao e produto ha
+760 movimentos C (R$ 581.065,06) e 5 D (R$ 2.716,00); com nr_devolucao mas sem
+produto ha 63 C e 250 D; sem nr_devolucao ha 8 C e 385 D. Existem 549 numeros
+de devolucao distintos, mas somente 497 deles possuem produto em pelo menos
+um movimento. Logo, mesmo dentro de uma mesma devolucao ha linhas que nao
+podem virar item Web sem uma regra de origem e de saldo.
+
+Somente de 01/01/2026 a 07/08/2026 sao 91 movimentos, quantidade 45 e valor
+R$ 97.805,34.
+
+A leitura direta da procedure pr_rel_ranking_produto confirmou por que uma
+carga ingenua produziria resultado errado: ela le cada linha com cd_produto de
+cliente_movto_credito, transforma C em quantidade/valor negativo e D em
+quantidade/valor positivo. No retrato atual sao 760 linhas C com produto e 5
+linhas D com produto. As 5 linhas D sao correcoes com observacoes como
+"LANCADO ERRADO" e nao podem ser gravadas como uma nova devolucao positiva no
+Web, pois o ranking Web considera somente devolucao_item.qt_devolvida positiva
+de uma devolucao CONFIRMADA. A carga correta precisaria de um evento de
+estorno/ajuste que o schema atual nao oferece para item de devolucao.
+
+Tambem existem 8 movimentos C sem nr_devolucao e 385 movimentos D sem
+nr_devolucao, totalizando R$ 4.998,22 e R$ 402.835,13 respectivamente. Eles
+representam ajustes/uso de credito sem um pai de devolucao identificavel; criar
+um pai sintetico faria o relatorio Web contar uma devolucao que o GIV nao
+classifica dessa forma. Por isso esses registros permanecem pendentes de uma
+decisao de modelagem, e nao foram forjados pelo conversor.
+
+As definicoes das procedures GIV pr_rel_ranking_vendedor,
+pr_rel_ranking_produto, pr_rel_compra_venda_produto e pr_rel_giro_estoque
+consultam cliente_movto_credito para compor devolucoes/movimentacoes. No Web,
+os repositorios equivalentes consultam devolucao e devolucao_item. Essas
+tabelas existem no tenant 8, mas a carga atual tem zero linhas de devolucao e
+devolucao_item confirmadas. O schema Web tambem possui
+cliente_credito_devolucao e cliente_credito_movimento, porem ambas estao com
+zero linhas no tenant 8. Elas exigem um pai devolucao, saldos anterior/posterior
+e movimentos append-only; portanto nao e seguro copiar cliente_movto_credito
+linha a linha sem reconstruir a devolucao e a ordem dos saldos.
+
+Tambem existem 715 unidades em prevenda_item.qt_devolvido no Web, mas o
+ranking atual deliberadamente fixa qt_devolvido=0 e considera somente eventos
+confirmados em devolucao_item. Esse campo nao pode ser somado automaticamente
+sem validar a correspondencia com os movimentos C/D do GIV, para nao contar a
+mesma devolucao duas vezes.
+
+O GIV tambem possui credito de fornecedor, usado pela procedure
+pr_rel_credito_fornecedor: 840 movimentos C/D, total de R$ 1.472.291,10 no
+periodo auditado. A consulta do schema confirmou que nao existe tabela
+public.fornecedor_movto_credito no Web e nao foi encontrado no projeto_v1 um
+repositorio equivalente. Esse relatorio nao tem como ficar igual por ajuste de
+tela; exige criacao de modelo/carga do credito de fornecedor ou uma decisao
+explicita de nao oferece-lo no Web.
+
+5.2 MOVIMENTOS DE ESTOQUE
+-------------------------
+
+- GIV movimento_estoque: 60.645 registros entre 30/04/2020 e 04/08/2026;
+- Web movimento_estoque: 60.647 registros no tenant 8/empresa 7, sendo
+  60.645 com origem GIV e 2 ajustes manuais que ja existiam no Web antes da
+  carga efetiva (confirmados na fotografia pre-carga).
+
+Antes da carga isso afetava saldo de estoque em datas passadas, giro e o
+relatorio de movimentacao manual. Depois do commit, a historia GIV esta na
+tabela correta e os 1.824 movimentos GIV de entrada/saida direta tambem foram
+marcados como MANUAL-GIV para a selecao de ajuste manual.
+
+O conversor foi ampliado com as opcoes 26/27 para importar
+operacao_estoque/movimento_estoque de forma idempotente. O teste completo em
+transacao com rollback foi concluido sem gravacao efetiva:
+
+- 66 operacoes lidas, 66 inseridas no teste, 0 erros;
+- 60.645 movimentos lidos, 60.645 inseridos no teste, 0 erros;
+- 2 produtos que faltavam no mapa principal foram resolvidos pelo mapa
+  estrutural de produto existente, sem criar novos cadastros;
+- usuarios sem correspondencia usaram o usuario padrao do tenant.
+
+Conferencia especifica das entradas/saidas diretas do GIV e do Web:
+
+  operacao 2 - ENTRADA DIRETA: 958 movimentos, quantidade 1.394;
+  operacao 3 - SAIDA DIRETA: 866 movimentos, quantidade 899;
+  Web MANUAL-GIV: 1.824 movimentos, quantidade 2.293,00000; alem de 2
+  movimentos manuais antigos, quantidade 1,00002.
+
+Validacao do filtro da tela de movimentacao manual:
+
+  o repository do Web seleciona origem MANUAL ou MANUAL-*; portanto os
+  marcadores MANUAL-GIV-* importados entram no relatorio da tela;
+  o recorte MANUAL-GIV bate exatamente com o GIV: 1.824 movimentos,
+  1.394 de entrada, 899 de saida e quantidade total 2.293,00000;
+  o total bruto do Web fica 1.826 movimentos e 2.294,00002 porque tambem
+  inclui os dois ajustes anteriores a carga do conversor: nr_movto 3686/produto
+  663123 (0,00001) e nr_movto 3687/produto 663128 (1,00001). Eles nao sao
+  duplicacao da carga GIV.
+
+Assim, a carga levou tambem os movimentos diretos para a classificacao
+equivalente do Web. A formula de saldo/custo historico continua sendo uma
+pendencia separada de logica/schema, descrita na secao 5.4.
+
+As operacoes e movimentos usados no teste foram revertidos e as sequences
+foram restauradas. Para a proxima conversao, a opcao T ja inclui essa carga;
+para uma retomada especifica, use 26 e 27 na ordem indicada pelo menu.
+
+Revalidacao live final do conversor em 07/08/2026, usando --dry-run com as
+opcoes 26,27 no mesmo tenant/empresa, confirmou novamente:
+
+  66 operacoes preparadas, 66 inseridas na simulacao, 0 erros;
+  60.645 movimentos preparados, 60.645 inseridos na simulacao, 0 erros ou
+  pulos;
+  rollback executado automaticamente, sem gravacao no Web.
+
+Logo, esse grupo deixou de ser pendencia de execucao: a carga efetiva foi
+confirmada com 60.645 linhas e soma de quantidade igual ao GIV. Creditos de
+cliente, devolucoes e credito de fornecedor continuam sendo outro grupo, pois
+ainda exigem mapeamento/modelagem especificos.
+
+5.3 BANCO E CAIXA
+-----------------
+
+- GIV banco_movto: 8.165 movimentos para a empresa GIV 1;
+- valor movimentado no escopo: R$ 12.981.169,41;
+- distribuicao: 4.690 liquidacoes de contas a pagar, 1.705 liquidacoes de
+  contas a receber e os demais movimentos diretos, estornos e transferencias;
+- Web titulo_pagar_movimento_bancario: 4.692 grupos importados, R$
+  5.448.890,75;
+- Web titulo_receber_movimento_bancario: 1.699 grupos importados, R$
+  4.033.949,78;
+- GIV caixa_movto: 10.512 movimentos;
+- GIV caixa_status: 1.725 fechamentos/status (fora do escopo por decisao do
+  usuario);
+- GIV caixa_titulo: 3.758 vinculos de titulos;
+- Web caixa_movimentacao: 10.512 registros importados, R$ 19.477.928,21;
+  caixa_suprimento_sangria permanece sem registros porque a rotina converteu
+  CX/E e CX/S para caixa_movimentacao. O Web possui as tabelas
+  cliente_credito_*, mas elas nao substituem credito/devolucao e continuam
+  vazias no escopo.
+
+No GIV, caixa_movto tem 9.497 entradas (R$ 16.592.928,50) e 1.015 saidas
+(R$ 2.884.999,71). A tabela Web exige cd_caixa, usuario e classificacao da
+operacao; por isso tambem nao basta copiar somente data e valor. A rotina 28
+resolveu o de/para GIV caixa 1 -> Web cd_caixa 9, usuario e forma de
+pagamento, alem do vinculo caixa_titulo.
+
+Uma carga efetiva posterior inseriu os 10.512 registros e a consulta live
+confirmou tipos D/R/S/V e valores iguais ao GIV. Os 2.160 movimentos RB
+mantiveram R$ 3.632.283,11; os vinculos de caixa_titulo foram gravados no
+documento/parcela da movimentacao sem duplicar titulos.
+
+Os codigos de origem confirmados foram: caixa E/PV = 7.333 movimentos
+(R$ 12.252.984,44), E/RB = 2.160 (R$ 3.632.283,11), E/CX = 4
+(R$ 707.660,95) e S/CX = 1.015 (R$ 2.884.999,71). O relatorio Web normaliza
+VENDA, RECEBIMENTO, SUPRIMENTO e SANGRIA com semanticas diferentes; a carga
+precisa preservar tambem nr_movto, nr_recebimento, nr_caixa e os vinculos de
+caixa_titulo para nao duplicar recebimentos.
+
+O banco_movto se divide, nas linhas com pessoa e chave completa de titulo, em
+1.691 C/C (R$ 4.020.534,37), 12 C/D (R$ 13.415,41), 5 F/C (R$ 1.452,39) e
+4.690 F/D (R$ 5.447.438,36): 6.398 linhas e R$ 9.482.840,53. As demais 1.767
+linhas somam R$ 3.498.328,88 e sao movimentos diretos ou sem chave completa.
+Como o Web possui indice unico por titulo/tipo no receber, a rotina 29 agrega
+as linhas repetidas por titulo e preserva os ids GIV na observacao.
+
+No caixa, os 10.512 movimentos sao 7.333 entradas de venda PV
+(R$ 12.252.984,44), 2.160 entradas de recebimento RB (R$ 3.632.283,11), 4
+entradas de tipo CX (R$ 707.660,95) e 1.015 saidas (R$ 2.884.999,71). Ha ainda
+1.724 status FE e 1 status AB. Os movimentos de caixa precisam ser convertidos
+para caixa_movimentacao sem duplicar recebimentos de titulos; os status FE/AB
+ficam fora do escopo desta auditoria.
+
+Assim, a rotina 28/29 cobre com seguranca o historico de caixa_movto e os
+movimentos bancarios vinculados a titulos, e essa carga ja foi efetivada no
+banco live. Os movimentos bancarios diretos continuam sem tabela Web
+equivalente. Os vinculos caixa_titulo ja sao usados na montagem de
+caixa_movimentacao e nao devem ser inseridos novamente como valores.
+Caixa_status/caixa_fechamento foi explicitamente retirado do escopo por
+decisao do usuario; nao sera criado de/para nem usado como bloqueio desta
+auditoria.
+
+Os creditos/devolucoes de cliente, o credito de fornecedor e os movimentos
+bancarios diretos continuam lacunas de conversao/modelo, nao erros de
+renderizacao. Para paridade total desses relatorios, o Web precisa de carga
+controlada/modelo correspondente ou de uma camada de compatibilidade que leia
+o legado; o TXT nao autoriza alterar o projeto_v1 nesta etapa.
+
+5.4 LIMITACOES DE SCHEMA E LOGICA
+---------------------------------
+
+Outras limitacoes de paridade encontradas no proprio codigo do projeto_v1:
+
+- saldo de estoque historico: a quantidade segue a regra do GIV usando o
+  primeiro movimento posterior a data-base, mas o GIV possui uma tabela
+  historica de custo medio que nao existe no schema Web; em datas passadas o
+  Web usa o custo medio atual;
+- saldo de estoque: o indicador empresa.tipo do GIV nao existe no schema Web,
+  entao a classificacao Loja/Administracao nao pode ser reproduzida exatamente;
+- giro de estoque: as formulas seguem a procedure do GIV e devolucoes
+  confirmadas reduzem venda/custo, mas o Web nao possui romaneio e nao inclui
+  esse movimento.
+
+Conclusao: os totais de notas, prevendas, condicionais e titulos auditados
+estao iguais, e os historicos de estoque, caixa e movimentos bancarios
+vinculados ja foram carregados. Ainda assim, rankings, relatorios de
+compra/venda, giro, saldo historico, extrato bancario e demonstrativo de caixa
+podem divergir por fonte, formula, custo historico, movimentos diretos e
+creditos/devolucoes sem modelo. Esses pontos exigem ajustes de regra/modelo no
+projeto_v1 ou uma camada de compatibilidade antes de afirmar paridade total.
+
+5.5 FONTE DE VENDAS USADA PELOS RELATORIOS
+-------------------------------------------
+Foi confirmada uma diferenca adicional entre a procedure legada e os
+repositorios atuais do Web. As procedures GIV pr_rel_ranking_produto,
+pr_rel_ranking_vendedor e pr_rel_giro_estoque leem pedido_venda e
+pedido_venda_item, filtrando pedido_venda.id_situacao = 'CX'. A regra de
+vendas da pr_rel_compra_venda_produto tambem parte desse movimento e depois
+ajusta estoque, devolucoes e transferencias.
+
+No snapshot atual, para a empresa GIV 1:
+
+- pedido_venda faturado (CX): 7.084 cabecalhos, 20.047 itens, quantidade
+  20.263 e valor dos itens apos desconto/acrescimo de R$ 12.419.711,38;
+- prevenda faturada (CX): 6.802 cabecalhos, 19.255 itens, quantidade 19.467
+  e valor dos itens apos desconto/acrescimo de R$ 12.016.978,19.
+
+O Web recebeu a tabela GIV prevenda, mapeada para prevenda com status F, e os
+mesmos totais da prevenda foram confirmados no tenant 8/empresa 7. Isso deixa
+uma diferenca de 282 documentos, 792 itens, 796 unidades e R$ 402.733,19 no
+conjunto usado pelas procedures de ranking/giro do GIV. Nao e uma diferenca de
+renderizacao: e uma diferenca de fonte de fatos. Para paridade, e necessario
+decidir se pedido_venda deve ser convertido para o modelo Web, se deve ser
+relacionado a prevenda/nota_fiscal_saida, ou se os relatorios Web assumirao
+explicitamente a prevenda como novo fato oficial.
+
+Consulta atual ao schema Web confirmou que nao existem as tabelas
+pedido_venda/pedido_venda_item. Portanto nao ha uma simples tabela esquecida
+na carga: os 282 documentos adicionais do GIV exigem um novo modelo ou uma
+decisao explicita de conversao para prevenda, sem misturar vendas ja
+importadas. Embora 4.378 numeros coincidam entre pedido_venda e prevenda no
+GIV, a prevenda nao possui nr_documento_origem preenchido nesse recorte; o
+numero isolado nao e uma chave segura de equivalencia e nao foi usado para
+fundir ou duplicar vendas.
+
+Uma reconsulta mostrou que os 7.084 pedidos_venda faturados (CX) possuem
+referencia de nota fiscal de saida no proprio GIV por nr_nota/serie. Portanto,
+as 282 vendas adicionais nao sao documentos sem nota: elas estao ligadas a
+NFs, mas nao estao representadas como fato de venda na prevenda Web. Isso
+abre duas alternativas para o projeto_v1: usar a NF como fato oficial de
+venda, preservando o vinculo pedido/NF, ou criar o modelo/carga de
+pedido_venda. Copiar essas linhas para prevenda sem esse vinculo continuaria
+podendo duplicar vendas.
+
+O relatorio de recebimentos de crediario foi confrontado separadamente. Com
+periodo de pagamento de 01/01/2020 a 07/08/2026 e formas CAR/CHQ/CRE, a
+pr_rel_recebimento_crediario do GIV retornou 14.410 linhas, R$ 11.889.165,18
+em titulos, R$ 62.671,70 de descontos, R$ 1.661,00 de acrescimos e
+R$ 11.889.165,18 pagos. A consulta equivalente dos titulos Web retornou os
+mesmos 14.410 registros e os mesmos totais. Portanto, o contas a receber
+conferido esta alinhado nesse recorte; a ausencia de historico de caixa afeta
+detalhes de caixa/forma/baixa, nao esse total de titulos.
+
+5.6 FORMULA DOS RANKINGS DE PRODUTO E VENDEDOR
+-----------------------------------------------
+Foi encontrada uma divergencia de logica independente da fonte de vendas. Os
+repositorios atuais do Web multiplicam vl_desconto e os acrescimos do item pela
+quantidade. Isso aparece em rankingProdutosRepository.ts e
+rankingVendedoresRepository.ts, tanto no SQL de rateio quanto no calculo final
+da linha.
+
+Na carga atual, porem, os campos de desconto/acrescimo de prevenda_item vindos
+do GIV ja representam o total da linha, e nao o valor unitario. A prova foi:
+
+  prevendas faturadas Web: 6.802;
+  total bruto dos itens: R$ 15.528.346,88;
+  desconto total dos itens importados: R$ 2.854.792,95;
+  formula atual do ranking, multiplicando desconto por quantidade:
+  R$ 12.010.812,48;
+  formula correta para os dados importados, descontando uma vez por linha:
+  R$ 12.016.978,19;
+  diferenca causada somente pela formula: R$ 6.165,71.
+
+O ultimo valor bate exatamente com o total dos cabecalhos de prevenda faturada.
+Essa diferenca ocorre antes de considerar as 282 vendas adicionais de
+pedido_venda, os creditos/devolucoes e outros movimentos historicos. Portanto,
+ha dois problemas separados: fonte de fatos diferente e multiplicacao indevida
+de um campo que foi convertido como total da linha.
+
+5.7 COBERTURA DOS RELATORIOS
+----------------------------
+O banco GIV possui 129 procedures com prefixo pr_rel. O projeto_v1 atual
+expone 12 familias principais de relatorio diretamente nas rotas /relatorios:
+ranking de vendedores, ranking de produtos, demonstrativo de caixa, extrato
+bancario, recebimento de crediario, contas a receber, contas a pagar, compra e
+venda, saldo de estoque, movimentacao manual de estoque, giro de estoque e
+notas fiscais de saida. Existe ainda uma rota adicional de extrato de produto,
+totalizando 13 rotas de consulta de relatorio quando ela e contada
+separadamente.
+
+As familias acima foram confrontadas conforme os dados disponiveis na carga.
+As demais procedures legadas, incluindo DRE, fluxo de caixa, apuracoes fiscais,
+contabil, comissoes, faturamento, inventario, cobranca, ranking de clientes e
+outras, nao possuem uma rota Web equivalente identificada no projeto_v1. Isso
+nao pode ser classificado como erro de item ou de conversao: e funcionalidade
+legada ainda nao representada no Web. Para afirmar paridade total de relatorios
+sera necessario criar os equivalentes ou definir formalmente que eles ficaram
+fora do escopo do Web.
+
+5.7.1 INVENTARIO BRUTO DAS PROCEDURES GIV
+------------------------------------------
+Consulta direta a SYS.SYSPROCEDURE, com proc_name LIKE 'pr_rel%', retornou 129
+procedures. A lista completa usada na auditoria foi:
+
+pr_rel_acompanhamento_cobranca_portador
+pr_rel_acompanhamento_cobranca_portador_detalhado
+pr_rel_acompanhamento_lista_presente_loja_virtual
+pr_rel_acompanhamento_loja
+pr_rel_acompanhamento_venda
+pr_rel_acompanhamento_venda_nota_fiscal_saida
+pr_rel_analise_contas_receber
+pr_rel_analise_contas_receber_a_vencer
+pr_rel_analise_contas_receber_atraso
+pr_rel_analise_contas_receber_vencido
+pr_rel_analise_financeiro
+pr_rel_analise_recebimento_mensal
+pr_rel_apropriacao_centro_custo_movto
+pr_rel_apuracao_icms
+pr_rel_apuracao_pis_cofins
+pr_rel_apuracao_pis_cofins_agrupado
+pr_rel_apuracao_pis_cofins_cfop
+pr_rel_apuracao_pis_cofins_dre
+pr_rel_apuracao_pis_cofins_produtos
+pr_rel_atendimento_hora
+pr_rel_balanco_estoque_diferenca
+pr_rel_balanco_patrimonial
+pr_rel_cartao_relacionamento_cliente
+pr_rel_centro_custo
+pr_rel_centro_custo_apropriacao
+pr_rel_centro_custo_manutencao
+pr_rel_cmv
+pr_rel_cmv_analitico
+pr_rel_comissao
+pr_rel_comissao_por_liquidacao_titulo_receber
+pr_rel_compra_grupo_produto
+pr_rel_compra_grupo_produto_sintetico
+pr_rel_compra_venda_produto
+pr_rel_compra_venda_produto_foto
+pr_rel_consignacao
+pr_rel_contabil_acompanhamento_entrada
+pr_rel_contabil_acompanhamento_saida
+pr_rel_contabil_icms_apuracao
+pr_rel_contabil_razao
+pr_rel_contabil_resumo_acumulador
+pr_rel_controle_qualidade_comparativo
+pr_rel_convenio
+pr_rel_conversao_condicional_venda
+pr_rel_conversao_condicional_venda_v2
+pr_rel_cotacao_compra_geral
+pr_rel_credito_fornecedor
+pr_rel_demonstrativo_caixa_nao_fiscal_pedido
+pr_rel_demonstrativo_caixa_pedido
+pr_rel_demonstrativo_resultado
+pr_rel_despesa_por_natureza
+pr_rel_despesa_por_natureza_conta_contabil
+pr_rel_dre
+pr_rel_dre_apuracao_pis_cofins
+pr_rel_dre_despesa_por_natureza
+pr_rel_dre_despesa_por_natureza_novo
+pr_rel_dre_fechamento_novo
+pr_rel_dre_novo
+pr_rel_dre_novo_v2
+pr_rel_dre_novo_v3
+pr_rel_estatistica_assistencia
+pr_rel_extrato_produto
+pr_rel_faturamento
+pr_rel_faturamento_analise_percentual
+pr_rel_faturamento_analise_percentual_abc
+pr_rel_faturamento_analise_percentual_geral
+pr_rel_fluxo_caixa
+pr_rel_fluxo_caixa_lista_contas
+pr_rel_fluxo_caixa_lista_contas_data
+pr_rel_fluxo_caixa_novo
+pr_rel_fluxo_caixa_novo_pessoas
+pr_rel_fluxo_caixa_prazo_medio
+pr_rel_fluxo_caixa_simplificado
+pr_rel_folha_pagto
+pr_rel_fornecedor_saldo
+pr_rel_generica_nota_entrada_analitico
+pr_rel_generica_pedido_compra_pendente_analitico
+pr_rel_generica_saldo_estoque_analitico
+pr_rel_generica_saldo_estoque_todas_empresas
+pr_rel_generica_venda_analitico
+pr_rel_giro_estoque
+pr_rel_giro_produto_por_colecao
+pr_rel_historico_cashback
+pr_rel_inadimplencia_mes_a_mes
+pr_rel_inventario
+pr_rel_inventario_estoque
+pr_rel_liberacao_produto_loja_virtual
+pr_rel_mapa_venda
+pr_rel_montagem
+pr_rel_movimentacao_estoque_acumulador
+pr_rel_necessidade_compra
+pr_rel_nf_devolucao_compra
+pr_rel_nota_fiscal_entrada
+pr_rel_nota_fiscal_saida
+pr_rel_nota_fiscal_saida_credito_presumido
+pr_rel_nota_fiscal_saida_monofasico
+pr_rel_orcamento_r01
+pr_rel_pedido_compra
+pr_rel_pedido_compra_agrupado
+pr_rel_plano_conta
+pr_rel_portador_comissao
+pr_rel_produto_por_assistencia_tecnica
+pr_rel_produto_sem_giro
+pr_rel_produto_sem_giro_detalhado
+pr_rel_produtos
+pr_rel_projecao_vendas_mensal
+pr_rel_ranking_cliente
+pr_rel_ranking_empresa
+pr_rel_ranking_grupo
+pr_rel_ranking_marca
+pr_rel_ranking_produto
+pr_rel_ranking_promocao
+pr_rel_ranking_vendedor
+pr_rel_recebimento_crediario
+pr_rel_resumo_venda
+pr_rel_retorno_clientes_lista
+pr_rel_romaneio_gnre
+pr_rel_saldo_estoque
+pr_rel_saldo_estoque_contabilidade
+pr_rel_sugestao_compra
+pr_rel_sugestao_compra_vendas_loja
+pr_rel_sugestao_compra_vendas_mes
+pr_rel_titulos_cobranca
+pr_rel_transferencia
+pr_rel_venda_estatistica_venda_grafico
+pr_rel_venda_grupo_produto
+pr_rel_venda_grupo_produto_comparativo
+pr_rel_vendas_canceladas
+pr_rel_vendas_por_caixa_efetivadas
+pr_rel_vendas_vendedor
+
+Esse inventario nao significa que cada procedure seja uma tela isolada: varias
+sao variantes da mesma familia. Ele serve para delimitar o escopo real e evitar
+declarar que as 12 familias principais (ou 13 rotas contando o extrato de
+produto) cobrem automaticamente todas as rotinas legadas.
+
+5.7.2 MATRIZ DAS ROTAS DE RELATORIO DO WEB
+------------------------------------------
+As rotas abaixo foram confirmadas no App.tsx e nos repositorios/rotas do
+projeto_v1. A coluna situacao indica o que foi possivel provar no snapshot;
+"parcial" nao significa que a tela esteja vazia, mas que ainda existe uma
+fonte, formula ou historico diferente do GIV.
+
+Rota/familia                         Fonte GIV principal                 Situacao e causa
+saldo de estoque                     pr_rel_saldo_estoque*                PARCIAL: custo historico/schema e tipo de empresa
+extrato de produto                   pr_rel_extrato_produto               PARCIAL: validar regra de custo/campos apos carga
+movimentacao manual de estoque       pr_rel_movimentacao_estoque_acumulador OK no recorte GIV; 2 ajustes Web preexistentes ficam fora da carga
+giro de estoque                      pr_rel_giro_estoque*                 PARCIAL: fonte pedido_venda, devolucao e estoque
+contas a receber                     pr_rel_analise_contas_receber*       OK nos totais de titulos auditados
+contas a pagar                       pr_rel_analise_financeiro             PARCIAL: regra de data do titulo 6869/3
+extrato bancario                     banco_movto / pr_rel_fluxo_caixa*     PARCIAL: vinculados carregados; diretos sem modelo generico
+recebimento de crediario              pr_rel_recebimento_crediario          OK no recorte de 14.410 baixas
+notas fiscais de saida               pr_rel_nota_fiscal_saida*             PARCIAL: filtros e formula nao seguem o GIV
+demonstrativo de caixa               pr_rel_demonstrativo_caixa_*          PARCIAL: caixa_movto carregado; validar regra; caixa_status fora do escopo
+ranking de produtos                  pr_rel_ranking_produto               PARCIAL: fonte e desconto/acrescimo multiplicado
+ranking de vendedores                pr_rel_ranking_vendedor               PARCIAL: fonte e desconto/acrescimo multiplicado
+compra e venda                       pr_rel_compra_venda_produto*          PARCIAL: pedido_venda nao convertido como fato oficial
+
+As rotas de contas a receber e recebimento de crediario sao as que tiveram
+paridade numerica comprovada no recorte auditado. As demais classificacoes
+estao detalhadas nas secoes 5.1 a 5.6 e nao devem ser apresentadas como 100%
+iguais sem nova carga/modelagem e nova consulta nos dois bancos.
+
+6. PRODUTOS, PRECOS E ESTOQUE
 -----------------------------
-Esta parte nao e problema de tela.
+Esta parte nao e problema de tela, mas precisa ser considerada ao avaliar a
+paridade total do cadastro.
+
+6.1 CADASTROS AUXILIARES E DUPLICIDADES
+----------------------------------------
+As contagens brutas de alguns cadastros nao sao iguais porque o GIV possui
+descricoes repetidas e o Web reaproveita uma unica linha quando a combinacao
+permitida pelo seu modelo e a mesma. A conferencia por nome normalizado e,
+quando aplicavel, por grupo pai mostrou:
+
+  Grupo_moda: 131 GIV -> 93 Web; 38 duplicidades de descricao, e as 93
+  descricoes distintas estao no Web;
+  subgrupo_moda: 247 GIV -> 229 Web; 18 repeticoes da mesma descricao dentro
+  do mesmo grupo pai, e as 229 combinacoes grupo/descricao estao no Web;
+  marca: 447 GIV -> 431 Web; repeticoes de descricao consolidadas;
+  cor: 1.759 GIV -> 1.710 Web; repeticoes de descricao consolidadas;
+  tamanho: 78 GIV -> 66 Web; repeticoes de descricao consolidadas;
+  unidade: 6 GIV -> 5 Web; a unidade UN aparece duas vezes no GIV;
+  colecao e grade: contagens iguais, 8 e 7;
+  fornecedor e banco: contagens iguais, 616 e 16;
+  banco_conta: 5 em ambos; condicao_pagto 72 GIV -> 65 Web por
+  reaproveitamento de descricoes/formas; cartao_administradora 25 em ambos.
+
+As tabelas de relacionamento tambem foram conferidas:
+
+  grade_item: 131 linhas no GIV viram 121 pares unicos no Web; os 10 pares
+  restantes eram repeticoes e nenhum par esperado ficou ausente;
+  condicao_pagto_forma: 113 linhas do GIV viram 105 pares unicos depois do
+  mapeamento de condicao e forma; os 105 pares esperados estao no Web, sem
+  vinculo faltante.
+
+Nas contagens iguais ainda existem normalizacoes de texto: o banco GIV com
+codigo 0 e descricao vazia virou "BANCO 0" no Web; e algumas descricoes de
+cartao foram limitadas ao tamanho da coluna Web (por exemplo, "C VISA/MASTER
+CREDITO" e parcelas com faixa completa). O conversor atualizado aplica esses
+limites antes de procurar registros existentes e mapeia os codigos usados nos
+documentos para as linhas reaproveitadas.
+
+Nos cadastros de usuario, o GIV tem 18 linhas, mas os codigos reservados 0 e 1
+sao ignorados explicitamente pelo conversor; as 16 demais foram para o Web.
+Nos clientes, os 1.657 nomes do GIV estao representados no Web. A contagem Web
+fica 1.658 porque ja existia um cliente CONSUMIDOR padrao e a carga tambem
+importou o CONSUMIDOR do GIV. Se for desejada uma base sem redundancia, esse
+ajuste e do conversor/carga de saneamento, nao da tela.
 
 Contagens atuais:
 
-- produtos GIV: 323.598
-- produtos Web: 323.585
-- precos GIV/Web: 323.598 / 323.585
-- estoques GIV/Web: 323.598 / 323.585
+- GIV: 40.241 raizes + 283.357 filhos = 323.598 produtos;
+- Web: 40.243 produto_info + 283.343 produto_filho = 323.586 produtos;
+- precos GIV/Web: 323.598 / 323.586;
+- estoques GIV/Web: 323.598 / 323.586.
 
-Foram identificadas 14 colisoes de variacao: dois codigos GIV diferentes,
-normalmente com cores/tamanhos que acabam no mesmo cadastro auxiliar Web,
-foram relacionados ao mesmo produto filho Web. Os valores dessas duplicidades
-sao iguais e o Web nao consegue manter duas linhas com a mesma combinacao de
-familia, cor e tamanho por causa da restricao de unicidade.
+Os 14 filhos que nao viraram uma nova linha Web foram identificados pelos
+furos da sequence e pelos avisos de variacao ja existente. Sao eles:
+
+  8221457, 8221512, 8241807, 8254197, 8261296, 8261297, 8263377,
+  8263622, 8263623, 8263842, 8263847, 8263868, 8263872 e 8263877.
+
+O motivo foi a restricao funcional de uma unica combinacao familia/cor/tamanho
+no produto_filho Web. Isso e uma consolidacao de variacao, nao uma perda de
+item de documento; os documentos e seus itens foram importados integralmente.
+Os precos dessas 14 linhas nao podem ser somados novamente no mesmo produto
+Web sem decidir qual codigo GIV deve vencer.
+
+Ha dois registros Web com a mesma chave natural CAMISA COURO/referencia 66345:
+
+- Web 677411 ja existia antes da carga;
+- Web 677412 foi inserido na carga efetiva por ser necessario em documento;
+- no GIV existem duas raizes com essa mesma descricao/referencia: 234565 e
+  239380, ambas com compra R$ 1.800,00 e venda R$ 3.898,00.
+
+A comparacao bruta atual fica GIV 323.598 contra Web 323.586: 14 variacoes
+filho GIV continuam consolidadas pela combinacao familia/cor/tamanho e ha duas
+linhas info Web acima da contagem de raizes GIV, representadas por esses
+registros de CAMISA COURO. A decisao de saneamento dessa chave duplicada deve
+considerar os documentos que a referenciam.
 
 Totais agregados atuais:
 
                          GIV                 Web                 diferenca Web-GIV
-vl_venda                191.718.569,38      191.712.417,38       -6.152,00
-vl_compra             2.737.670.696,85    2.737.668.174,74       -8.522,11
-vl_custo              2.737.677.337,80    2.737.674.815,69       -2.522,11
+vl_compra             2.737.670.696,85    2.737.669.974,74         -722,11
+vl_ult_compra         2.737.419.318,80    2.737.414.996,69       -4.322,11
+vl_venda                191.718.569,38      191.716.315,38       -2.254,00
+vl_custo              2.737.677.337,80    2.737.676.615,69         -722,11
 vl_custo_medio        2.737.261.755,93    2.737.257.659,86       -4.096,07
-qt_fisico/disponivel        2.368,00            2.369,00002       +1,00002
+pr_margem_lucro          184.556.240,01      184.554.603,50       -1.636,51
+qt_fisico/disponivel        2.368,00            2.368,00000        0,00000
 
-Conclusao: esses totais nao devem ser usados para afirmar que a tela de notas
-esta errada. Eles resultam do reaproveitamento de produtos ja existentes no
-tenant e da consolidacao de variacoes que o Web considera iguais. Se for
-obrigatorio que o total bruto de linhas de preco/estoque seja identico ao GIV,
-o conversor precisara de uma etapa explicita de reconciliacao/atualizacao dos
-produtos reaproveitados, ou a carga devera ser feita em um tenant realmente
-limpo. Essa decisao nao deve ser implementada no projeto_v1.
+Os precos das 14 linhas filho consolidadas e as duas raizes CAMISA COURO
+explicam exatamente os abatimentos e compensacoes observados. As 14 linhas
+GIV que colidem somam R$ 4.322,11 em compra, ultima compra e custo,
+R$ 10.050,00 em venda, R$ 4.096,07 em custo medio e R$ 1.869,63 em margem;
+esses valores ficam representados uma unica vez no Web por causa da chave
+unica da variacao. As duas raizes Web 677411/677412 acrescentam juntas
+R$ 3.600,00 em compra/custo, R$ 7.796,00 em venda e R$ 233,12 em margem.
+O resultado liquido desses dois efeitos e exatamente a diferenca agregada
+Web-GIV apresentada na tabela. Portanto, nao ha alteracao aleatoria de
+preco: ha uma diferenca estrutural de cardinalidade/de-para, sem perda do
+preco da variacao operacional representada.
 
-5. RESUMO EXECUTIVO PARA IMPLEMENTACAO
+Os dois residuos de estoque foram reconciliados pelo conversor apos um dry-run:
+
+- GIV 8249610 -> Web 663123: GIV e Web agora zerados;
+- GIV 8249615 -> Web 663128: GIV e Web agora zerados.
+
+A consulta pos-commit confirmou estoque fisico/disponivel agregado de
+2.368,00000 nos dois bancos, sem residuo nesses produtos. Essa correcao foi
+feita no conversor/carga, nao na tela do projeto_v1.
+
+6.2 IDEMPOTENCIA DE BANCO_CONTA E CARTAO_ADMINISTRADORA
+-------------------------------------------------------
+Uma simulacao integrada dos cadastros e de produto, usando --dry-run e
+--limit-products 1000, terminou sem erro de insercao nos dados selecionados:
+
+  11.445 produtos selecionados (1.000 raizes e seus filhos);
+  5.772 insercoes de produto simuladas, 0 erros;
+  5 variacoes duplicadas ignoradas pela regra estrutural;
+  todos os cadastros selecionados com 0 erros.
+
+Essa rodada inicial revelou um problema de retomada do conversor, e nao uma
+duplicidade ja gravada na base atual. O Web tinha 5 banco_conta com as mesmas
+chaves naturais do GIV (banco, agencia, numero da conta e descricao), mas a
+rotina antiga nao procurava/reaproveitava a conta existente: reservava nova
+sequencia e inseria novamente as 5 contas. Durante a simulacao antiga, a
+validacao mostrou GIV=5 e Web=10, com saldo e limite dobrados. O rollback
+restaurou a situacao; a conferencia live posterior continuou com 5 contas.
+
+O mesmo ocorreu com cartao_administradora por causa do limite de tamanho das
+descricoes no Web. GIV e Web tem 25 cartoes na fotografia atual, mas 6
+descricoes do GIV nao coincidem exatamente com as descricoes truncadas que ja
+existem no Web:
+
+  GN MASTER PARC 7 A 12
+  C VISA/MASTER CREDITO
+  C VISA/MASTER PARC 2 A 6
+  C VISA/MASTER PARC 7 A 10
+  C ELO/AMEX PARC 2 A 6
+  C ELO/AMEX PARC 7 A 10
+
+Na simulacao antiga, essas 6 seriam tratadas como novas e a validacao mostrou
+GIV=25 e Web=31. O banco live nao foi alterado e permanece com 25. O conversor
+foi corrigido para reutilizar contas por chave natural e cartoes por tipo +
+descricao ja normalizada/truncada. A revalidacao posterior, isolando 23 e 25,
+reaproveitou 5/5 contas e 25/25 cartoes, com 0 insercoes novas e 0 erros. A
+integracao com cadastros e 1.000 raizes de produto tambem terminou com
+banco_conta GIV=5/Web=5 e cartao_administradora GIV=25/Web=25. O ajuste pertence
+ao conversor; nao e ajuste de tela do projeto_v1.
+
+7. RESUMO EXECUTIVO PARA IMPLEMENTACAO
 ---------------------------------------
 
 [CORRIGIR NO projeto_v1]
 
 - modal de detalhe da NF: usar descontos/acrescimos/impostos no total do item;
-- resolver nome de produto filho pelo produto pai;
+- validar no deploy o fallback de nome de produto filho ja existente no codigo;
 - nao exibir observacao/complemento como nome do produto;
-- aplicar o mesmo nome pai/filho no relatorio analitico;
 - alinhar filtro de datas do dashboard de contas a pagar com a lista;
 - definir tratamento para vencimentos invalidos, incluindo o titulo 6869/3 de
   17/05/1818;
-- se necessario, alinhar o sintetico de NF de saida com a procedure do GIV.
+- corrigir o total liquido do detalhe da NF de entrada;
+- decidir como levar cliente_movto_credito legado para os relatorios de
+  devolucao/ranking;
+- alinhar o sintetico de NF de saida com a procedure do GIV: calcular pelos
+  itens, aplicar os filtros de CF/ECF, D1, situacao e cancelamento e definir se
+  a lista de CFOP vale para o cabecalho ou para o item;
+- decidir a fonte oficial dos relatorios de venda: as procedures GIV usam
+  pedido_venda, enquanto os repositorios Web usam prevenda; a base atual tem
+  282 vendas faturadas a mais no pedido_venda do GIV;
+- corrigir a formula dos rankings de produto/vendedor para nao multiplicar por
+  quantidade o desconto/acrescimo que ja veio como total da linha; criar teste
+  de regressao em que as prevendas faturadas somem R$ 12.016.978,19 antes dos
+  ajustes de fonte, creditos e devolucoes;
+- revisar a precisao fiscal exibida: o GIV guarda alguns valores de ICMS com
+  mais de duas casas, enquanto o schema Web de NF/item usa numeric(12,2). O Web
+  bate com o GIV quando o relatorio arredonda por linha, mas nao preserva a
+  precisao bruta original.
+
+[CONVERSOR / MODELAGEM DE HISTORICO]
+
+- criar carga controlada de cliente_movto_credito/devolucao;
+- carga de movimento_estoque e operacao_estoque: implementada no conversor;
+- mapear banco_movto para movimentos bancarios de titulos e tratar movimentos
+  diretos;
+- mapear caixa_movto e caixa_titulo para o modelo de caixa Web; caixa_status/
+  caixa_fechamento foi excluido do escopo por decisao do usuario;
+- somente depois revalidar rankings, giro, saldo historico, extrato e caixa.
 
 [NAO E AJUSTE DO projeto_v1]
 
-- diferenca de 13 linhas de produto/preco/estoque e os totais agregados acima:
-  revisar no conversor/regras de reaproveitamento ou fazer a carga em tenant
-  limpo; nao tentar corrigir isso na tela.
+- diferenca liquida atual de 12 linhas de produto/preco (14 filhos GIV
+  consolidados e 2 linhas info Web para a chave CAMISA COURO), alem dos totais
+  agregados de preco acima: revisar no conversor/regras de reaproveitamento ou
+  fazer saneamento controlado; o estoque ja foi reconciliado e nada disso deve
+  ser corrigido na tela;
+- historicos de devolucao/credito, credito de fornecedor e movimentos bancarios
+  diretos: precisam de carga controlada/modelagem; estoque, caixa e movimentos
+  bancarios vinculados ja foram carregados. Nada disso e ajuste visual.
+- idempotencia de banco_conta e cartao_administradora: corrigida no conversor
+  para reaproveitar os registros ja existentes por chave natural e descricao
+  truncada; validada em dry-run isolado e integrado, sem gravacao no Web.
+- procedures de relatorio GIV sem rota equivalente no Web: representam ausencia
+  de funcionalidade/escopo, nao uma falha de conversao dos registros ja
+  importados.
+
+8. ARTEFATO GERADO
+------------------
+O conversor foi recompilado apos os ajustes de idempotencia de cadastros e
+documentos, mapeamento estrutural de produtos, historico de estoque, de/para
+de caixa nos documentos e carga controlada dos historicos de caixa/banco. Esta
+disponivel em:
+
+C:\Users\conversao01\Desktop\Conversor GIV - WEB\dist\ConversorGIVWeb.exe
+
+- build: 08/08/2026 01:49:06
+- arquitetura PE: 32-bit (0x014C), compativel com o DSN SQL Anywhere 32-bit;
+- tamanho: 14.479.602 bytes;
+- SHA-256:
+  6D7E346080CFFA02B98190CDAEA351E2885E7AF1157785E1EBC33D01EC55C2D7
+- a pasta dist possui um unico executavel ConversorGIVWeb.exe; o arquivo
+  reverter.txt e apenas o auxiliar de reversao, nao e outro executavel.
+
+8.1 REVALIDACAO OPERACIONAL DO CONVERSOR
+----------------------------------------
+Nota: os resultados desta subseção registram simulacoes anteriores ao commit
+historico; o estado live posterior esta consolidado na secao 14.
+
+Foram executadas simulacoes adicionais sem gravacao efetiva:
+
+- opcoes 26/27: 66 operacoes e 60.645 movimentos, 0 erros, rollback;
+- opcoes 28/29: 10.512 movimentos de caixa e 6.391 grupos bancarios
+  preparados, 0 erros de carga, rollback; 1.767 movimentos bancarios diretos
+  ficaram explicitamente fora do modelo por nao possuirem titulo no GIV;
+- opcao 14 isolada com --limit-products 1: 12 produtos analisados, 0 erros,
+  rollback;
+- cadastros + opcao 14 com --limit-products 1000, depois da correcao de
+  idempotencia: 11.445 produtos selecionados, 5.772 insercoes simuladas, 0
+  erros de insercao e 5 variacoes duplicadas ignoradas; os cadastros
+  selecionados tambem terminaram com 0 erros. A validacao mostrou
+  banco_conta GIV=5/Web=5 e cartao_administradora GIV=25/Web=25; tudo foi
+  revertido.
+- opcoes 23 e 25 isoladas depois da correcao: 5 contas e 25 cartoes
+  reaproveitados, 0 insercoes novas e 0 erros; rollback.
+- mapeamento usado quando somente uma rotina/documento e selecionado: 5
+  contas GIV relacionadas aos codigos Web 10..14 e 25 cartoes relacionados,
+  inclusive as 6 descricoes que precisavam ser truncadas; nenhuma gravacao.
+- T com --limit-products 1: o fluxo integrado avancou por cadastros,
+  produto, operacoes, mapas e rotinas/documentos e terminou com codigo 0 e
+  rollback. Como o limite restringe o mapa de produtos, essa rodada gera
+  avisos de produtos faltantes nas rotinas e nao substitui o teste integral.
+
+A rodada integral T sem limite foi repetida depois das correcoes de
+idempotencia, do mapeamento estrutural de produtos e do vinculo caixa_titulo.
+Terminou em 644,8s, com codigo 0, rollback e sem erro de insercao. O resultado
+principal foi:
+
+- fornecedores: 616/616 reaproveitados; usuarios: 16/16; 1.657 clientes GIV
+  com de/para resolvido; o Web atual tem 1.658 linhas porque reteve/ja possuia
+  um registro natural adicional;
+- produtos: 323.598 registros de origem comparados com 323.585 linhas Web
+  atuais; 0 insercoes novas e 14 variacoes sem INSERT porque eram combinacoes
+  ja consolidadas no Web, alem de uma raiz Web extra; diferenca liquida 13;
+- estoque: 323.585 saldos atuais conferidos, 2 reconciliacoes simuladas,
+  0 erros;
+- historico: 66 operacoes e 60.645 movimentos de estoque simulados, 0 erros;
+- pedidos, notas, prevendas, condicionais e itens: todos reaproveitados sem
+  duplicidade; titulos a receber/pagar reaproveitados. Os historicos de
+  estoque, caixa e banco foram somente simulados em dry-run e ainda nao foram
+  gravados no Web live;
+- historico de caixa: 10.512 movimentos simulados, 0 erros; movimentos
+  bancarios: 6.391 grupos de titulos simulados, 0 erros, R$ 9.482.840,53
+  vinculados/importados e R$ 3.498.328,88 fora do modelo direto;
+- validacao final GIV x Web: todos os totais comparados terminaram com [OK],
+  incluindo contas a pagar abertas de R$ 446.274,34 e contas a receber abertas
+  de R$ 236.563,21.
+
+Como foi dry-run, as 66 operacoes, os 60.645 movimentos, os 10.512 historicos
+de caixa e os movimentos bancarios nao foram gravados; a rodada serve para
+validar o que o EXE faria numa carga efetiva.
+
+Conferencia live apos todas as simulacoes: grupo=93, marca=431,
+produto_info=40.242, produto_filho=283.343, movimento_estoque=2,
+nota_fiscal_saida=13.237 e titulo_pagar=13.032; os valores permaneceram
+inalterados.
+
+Conferencia live especifica apos a recompilacao: banco_conta=5, com saldo
+total de R$ -1.030.274,34 e limite total de R$ 1.101.099.998,99;
+cartao_administradora=25; movimento_estoque=2, quantidade 1,00002;
+titulo_pagar_movimento_bancario=0; titulo_receber_movimento_bancario=0;
+caixa_movimentacao=0; devolucao_item=0. Nenhuma simulacao alterou esses
+numeros.
+
+9. REVALIDACAO FINAL DO SNAPSHOT PRE-CARGA
+--------------------------------
+Nota: esta secao descreve a fotografia anterior a carga efetiva de historicos;
+nao substitui a revalidacao pos-commit da secao 14.
+
+Na ultima consulta read-only ao mesmo escopo (GIV empresa 1, Web tenant 8 /
+empresa 7), 14 assercoes de contagem/total de documentos, itens, titulos e
+formula passaram
+sem diferenca. O titulo 6869/3, o total aberto de contas a pagar e a formula
+financeira corrigida dos itens de prevenda tambem foram confirmados diretamente
+nos dois bancos.
+
+Uma revalidacao live mais ampla, executada depois, comparou 28 pares de tabela
+com o escopo efetivo de cada schema. Os 19 pares abaixo continuam exatamente
+iguais: departamento, colecao, grade, fornecedor, banco, banco_conta,
+cartao_administradora, pedido_compra e itens, nota_fiscal_entrada e itens,
+prevenda e itens, condicional e itens, nota_fiscal_saida e itens,
+titulo_receber e titulo_pagar.
+
+Os 9 pares com contagem diferente continuam sendo cadastros com semantica de
+deduplicacao ou registros reservados: grupo, sub_grupo, marca, cor, tamanho,
+unidade, usuario, cliente e condicao_pagamento. A diferenca nao e perda de
+documento/item. A consulta atual tambem repetiu os indicadores Web: 252 contas
+a pagar abertas somando R$ 446.274,34, 187 contas a receber abertas somando
+R$ 236.563,21 e 1 titulo anterior a 01/01/2000 somando R$ 1.488,66.
+
+A igualdade live atual de banco_conta e cartao_administradora foi confirmada
+na fotografia carregada e nas simulacoes de retomada apos a correcao: nenhuma
+das duas rotinas criou duplicidades e os totais permaneceram iguais. A rodada T
+integral sem limite tambem foi concluida depois dos ajustes, em dry-run, com
+codigo 0 e sem divergencias.
+
+O unico resultado de contagem estrutural que nao e igual continua sendo o
+produto: 323.598 no GIV contra 323.585 no Web, explicado pelas 14 variacoes
+consolidadas e uma raiz Web extra documentadas na secao 6. Os historicos GIV de
+estoque, credito, banco e caixa continuam ausentes das tabelas Web do escopo;
+por isso nao e correto declarar paridade total dos relatorios historicos ainda.
+
+10. REVALIDACAO READ-ONLY PRE-COMMIT
+------------------------------------
+Nota: esta consulta foi executada antes da carga efetiva de historicos; os
+numeros atuais estao na secao 14.
+
+Uma consulta read-only posterior, executada diretamente no ODBC GIV e no
+PostgreSQL Web, repetiu os principais indicadores sem abrir uma conversao e
+sem alterar qualquer banco. Os pares abaixo continuam iguais:
+
+- pedido_compra: 177 documentos, R$ 889.703,71; itens 1.949, quantidade
+  2.341,00000 e R$ 889.703,714000;
+- nota_fiscal_entrada: 2.653 notas, R$ 10.605.163,70 de nota e
+  R$ 10.874.810,89 de produto; itens 33.150, quantidade 37.560,00000 e
+  R$ 10.877.110,855300 brutos;
+- prevenda: 7.029 documentos, R$ 12.673.553,93 e desconto R$ 2.853.994,01;
+  itens 20.153, quantidade 20.368,0000 e R$ 15.528.346,880000 brutos;
+- condicional: 9.398 documentos, R$ 29.696.643,51; itens 66.908,
+  quantidade 67.124,0000 e R$ 56.847.809,610000 brutos;
+- nota_fiscal_saida: 13.237 notas, R$ 23.031.705,62 e desconto
+  R$ 2.775.067,62; itens 41.836, quantidade 42.377,00000 e
+  R$ 27.220.015,418400 brutos;
+- titulo_receber: 23.751 titulos, R$ 22.223.590,61 e R$ 20.069.407,99 pagos;
+- titulo_pagar: 13.032 titulos, R$ 13.893.406,69 e R$ 12.918.112,27 pagos.
+
+O Web continua com 252 contas a pagar abertas somando R$ 446.274,34. O unico
+registro aberto anterior a 01/01/2000 continua sendo 6869/3, serie IMP,
+vencimento 17/05/1818 e saldo R$ 1.488,66. Portanto a diferenca do filtro da
+lista continua sendo de tela/regra, nao de conversao.
+
+O retrato estrutural atual do Web permanece: produto=323.585,
+produto_info=40.242, produto_filho=283.343, produto_estoque=323.585,
+movimento_estoque=2, devolucao=0, devolucao_item=0,
+cliente_credito_devolucao=0, cliente_credito_movimento=0,
+titulo_pagar_movimento_bancario=0, titulo_receber_movimento_bancario=0,
+caixa_movimentacao=0, caixa_suprimento_sangria=0 e caixa_fechamento=1 (fora do
+escopo desta auditoria) no tenant 8/empresa 7.
+Esses zeros sao a evidencia atual de que os relatorios historicos ainda nao
+podem bater com o GIV, que possui 1.471 creditos de cliente, 8.165 movimentos
+bancarios e 10.512 movimentos de caixa. Os 1.725 registros de caixa_status/
+caixa_fechamento foram explicitamente excluidos da avaliacao.
+
+A revalidacao direta mais recente executou 14 assercoes de totais com as
+mesmas formulas de conversao/procedure: pedido de compra (cabecalho e itens),
+nota de entrada (cabecalho, itens e formula), prevenda (cabecalho e itens),
+condicional (cabecalho e itens), nota de saida (cabecalho, itens e formula) e
+contas a receber/pagar. As 14 passaram sem diferenca. A estrutura de produto
+tambem foi conferida: GIV 323.598 (40.241 raizes + 283.357 filhos), Web
+produto_info 40.242 e produto_filho 283.343; a diferenca continua explicada
+pelas 14 variacoes consolidadas e uma raiz Web adicional.
+
+11. CORRECAO DO DE/PARA DE CAIXA NOS DOCUMENTOS
+------------------------------------------------
+Foi identificada uma diferenca estrutural adicional nos documentos convertidos:
+o GIV usa o numero local nr_caixa=1, enquanto a caixa equivalente no Web, no
+tenant 8 / empresa 7, e cd_caixa=9 (CAIXA 01). Antes desta correcao, 6.823
+prevendas e 7.048 infos de nota fiscal de saida estavam com nr_caixa=1 no Web;
+os relatorios que fazem JOIN com caixa.cd_caixa nao encontravam a caixa correta.
+
+O conversor agora monta o de/para pela descricao da caixa dentro do tenant e
+reconcilia registros ja existentes em lote, sem inventar codigo quando nao ha
+correspondencia. A simulacao direcionada das opcoes 19 e 20 terminou em
+221,7s, codigo 0 e rollback, com:
+
+- mapa confirmado: GIV 1 -> Web 9 (CAIXA 01);
+- 6.823 prevendas corrigidas no que seria a carga;
+- 7.048 infos de NF de saida corrigidas no que seria a carga;
+- itens, notas, valores e validacoes GIV x Web sem divergencias;
+- nenhum INSERT, UPDATE ou DELETE efetivado no banco.
+
+Uma execucao efetiva posterior das opcoes 19 e 20 corrigiu 6.823 prevendas e
+7.048 infos de NF de saida. A consulta live confirmou prevenda com
+nr_caixa=9 em 6.823 linhas e nota_fiscal_saida_info com nr_caixa=9 em 7.048;
+as demais linhas nao possuem caixa GIV equivalente. Isso e ajuste do
+conversor/modelagem, nao do projeto_v1.
+
+12. HISTORICOS DE CAIXA E MOVIMENTOS BANCARIOS
+-----------------------------------------------
+Foi confirmado diretamente nos bancos que os relatorios historicos nao
+tinham como bater antes da nova rotina: o Web tinha zero registros em
+caixa_movimentacao, titulo_receber_movimento_bancario e
+titulo_pagar_movimento_bancario. Depois do commit, os registros vinculados
+foram conferidos no Web com os totais abaixo. No GIV, a fotografia da empresa
+1 tinha:
+
+- caixa_movto: 10.512 movimentos, total R$ 19.477.928,21;
+- banco_movto: 8.165 movimentos, total R$ 12.981.169,4100;
+- cliente_movto_credito: 1.471 movimentos, total R$ 1.189.494,31;
+- fornecedor_movto_credito: 840 movimentos, total R$ 1.472.291,10.
+
+O conversor recebeu as opcoes 28 e 29:
+
+- 28 - caixa_movto -> caixa_movimentacao;
+- 29 - banco_movto -> movimentos bancarios dos titulos.
+
+A opcao 28 converte PV para V (venda), RB para R (recebimento), CX/E para D
+(suprimento/entrada) e CX/S para S (sangria/saida). A simulacao combinada
+terminou com codigo 0, sem erros e com todos os 10.512 movimentos preparados:
+
+- D: 4 movimentos, R$ 707.660,95;
+- R: 2.160 movimentos, R$ 3.632.283,11;
+- S: 1.015 movimentos, R$ 2.884.999,71;
+- V: 7.333 movimentos, R$ 12.252.984,44.
+
+Para preservar o detalhamento do demonstrativo, a rotina tambem leu os 3.758
+vinculos de caixa_titulo do GIV. Cada vinculo pertenceu a um movimento de
+caixa distinto; quando existe titulo/parcela, o nr_documento Web e gravado no
+formato serie/nr_titulo-parcela e o cliente do vinculo e reaproveitado. Assim,
+o relatorio consegue abrir o recebimento no titulo correto, e nao apenas
+somar o valor geral do caixa.
+
+A opcao 29 encontrou 6.398 linhas bancarias vinculadas a titulos e preparou
+6.391 registros agregados no Web, preservando R$ 9.482.840,5300. A agregacao
+e necessaria porque o Web possui indice unico por titulo e tipo de movimento
+no contas a receber; uma parcela com varias linhas do GIV nao pode ser
+inserida individualmente sem duplicar o titulo. Um grupo tinha duas contas
+GIV e foi registrado com a conta de maior valor, mantendo o valor integral e
+as contas originais na observacao.
+
+Restaram 1.767 movimentos bancarios diretos/sem titulo, R$ 3.498.328,8800.
+Eles nao foram inventados como titulos: o schema Web atual nao possui uma
+tabela de movimento bancario generico sem titulo. Os vinculos caixa_titulo ja
+sao incorporados ao detalhamento de caixa_movimentacao e nao devem ser
+duplicados. O tema caixa_status/caixa_fechamento foi explicitamente excluido
+do escopo por decisao do usuario. Creditos de cliente, creditos de fornecedor
+e movimentos bancarios diretos continuam sendo pendencias de modelagem/carga
+historica; estoque, caixa e movimentos bancarios vinculados ja foram carregados
+e nao foram
+mascarados como contas a receber/pagar.
+
+13. VALIDACAO DA RODADA T COM OS HISTORICOS
+-------------------------------------------
+Uma simulacao integral T, incluindo as opcoes 28 e 29, terminou em 644,8s,
+codigo 0, com rollback automatico. Essa foi a validacao anterior ao commit:
+preparou 10.512 movimentos de caixa, 6.391 grupos de movimentos bancarios e
+nao efetivou nenhum INSERT, UPDATE ou DELETE. A rotina de caixa tambem
+carregou temporariamente os 3.758 vinculos de caixa_titulo.
+
+Depois, com autorizacao expressa, as opcoes 26,27,28,29 foram executadas em
+carga efetiva e confirmadas com commit. A consulta live posterior confirmou
+60.645 movimentos GIV de estoque, 10.512 de caixa, 1.699 movimentos bancarios
+de receber e 4.692 de pagar, sem duplicidade nas chaves do Web. O conversor
+marca cada origem com GIV-MOVTO ou GIV-BANCO para evitar duplicacao em
+retomadas. Caixa_status/caixa_fechamento esta fora do escopo e nao sera
+tratado nesta auditoria.
+Os 1.767 movimentos bancarios sem titulo e os historicos de
+credito/devolucao continuam explicitamente documentados para uma decisao de
+modelo no Web.
+
+14. REVALIDACAO POS-COMMIT DO ESTADO ATUAL
+------------------------------------------
+Depois das cargas efetivas autorizadas, foram executadas consultas read-only
+diretamente no ODBC GIV e no PostgreSQL Web, sem nova gravacao. O retrato
+atual do historico importado e:
+
+- GIV movimento_estoque: 60.645 linhas, quantidade 58.754,00000; Web:
+  60.645 marcadores GIV, mesma quantidade e nenhuma origem duplicada;
+- GIV caixa_movto: 10.512 linhas, R$ 19.477.928,21; Web: 10.512 marcadores,
+  mesmo valor, tipos D/R/S/V iguais e nenhuma origem duplicada;
+- GIV banco_movto: 8.165 linhas, R$ 12.981.169,4100; Web: 1.699 movimentos
+  de receber e 4.692 de pagar, soma vinculada R$ 9.482.840,53 e nenhuma
+  duplicidade por titulo/tipo;
+- GIV cliente_movto_credito: 1.471 linhas, R$ 1.189.494,31; Web continua
+  sem cliente_credito/devolucao equivalente;
+- GIV fornecedor_movto_credito: 840 linhas, R$ 1.472.291,10; Web continua
+  sem tabela equivalente;
+- os movimentos bancarios diretos/sem titulo continuam fora do modelo Web:
+  1.767 linhas e R$ 3.498.328,88.
+
+A inspeccao do schema confirmou que o Web possui somente os movimentos
+bancarios especificos de titulo (receber/pagar); nao existe uma tabela
+movimento_bancario generica para receber essas 1.767 linhas sem criar um
+titulo artificial. Tambem confirmou que cliente_credito_devolucao e
+cliente_credito_movimento exigem uma devolucao pai, saldos anterior/posterior,
+cliente e idempotency_key. Como o GIV mistura creditos, estornos e ajustes sem
+nr_devolucao ou sem produto, copiar linha a linha continuaria produzindo
+relatorios incorretos.
+
+O saldo de estoque tambem foi revalidado depois da reconciliacao do produto:
+GIV possui 323.598 saldos, quantidade 2.368,00000 fisico/disponivel; Web possui
+323.586 linhas por causa das 14 variacoes consolidadas e duas linhas de raiz
+CAMISA COURO, mas a quantidade fisico/disponivel agora e exatamente
+2.368,00000 e os produtos 663123/663128 estao zerados nos dois bancos.
+
+Os documentos principais continuam presentes no Web: 13.237 notas de saida,
+2.653 notas de entrada e 7.029 prevendas. O de/para de caixa tambem foi
+efetivado: 6.823 prevendas e 7.048 infos de NF usam cd_caixa=9, que e o
+equivalente Web do GIV nr_caixa=1. Caixa_status/caixa_fechamento permaneceu
+fora da conferencia por decisao expressa do usuario.
+
+A carga efetiva nao elimina as divergencias de logica ja comprovadas no
+projeto_v1: detalhe financeiro dos itens de NF, filtros/formula do sintetico
+de NF de saida, titulo de 1818 no contas a pagar, fonte/formula de rankings e
+compra-venda, alem de custo historico e fatos de credito/devolucao. Esses
+ajustes continuam somente no TXT, pois nenhum arquivo do projeto_v1 foi
+alterado.
+
+15. SNAPSHOT FINAL DA CONFERENCIA LIVE EM 08/08/2026
+-----------------------------------------------------
+Foi repetida a conferencia em conexoes limpas, somente leitura, depois das
+ultimas cargas e da reconciliacao do estoque. Os principais pares ficaram:
+
+- cadastros base: grupo 131/93, departamento 6/6, subgrupo 247/229,
+  marca 447/431, cor 1.759/1.710, tamanho 78/66, unidade 6/5, colecao 8/8,
+  grade 7/7, fornecedor 616/616, usuario 18/16, cliente 1.657/1.658,
+  banco 16/16, banco_conta 5/5, condicao_pagamento 72/65 e cartao 25/25
+  (GIV/Web); as diferencas estao explicadas por deduplicacao, registros
+  reservados e cliente consumidor padrao, sem chaves documentais faltantes;
+- pedido_compra: 177 documentos e R$ 889.703,71 nos dois bancos; 1.949 itens,
+  quantidade 2.341 e valor bruto R$ 889.703,714;
+- condicional/orcamento: 9.398 documentos, R$ 29.696.643,51; 66.908 itens,
+  quantidade cotada 67.124, faturada 14.158 e devolvida/suspensa 39.034;
+- prevenda: 7.029 documentos, R$ 12.673.553,93; 20.153 itens e quantidade
+  20.368 nos dois bancos;
+- nota fiscal de entrada: 2.653 notas, R$ 10.605.163,70 de nota e
+  R$ 10.874.810,89 de produto; 33.150 itens e quantidade 37.560;
+- nota fiscal de saida: 13.237 notas, R$ 23.031.705,62; 41.836 itens e
+  quantidade 42.377;
+- receber: 23.751 titulos e R$ 236.563,21 em aberto; pagar: 13.032 titulos
+  e R$ 446.274,34 em aberto;
+- saldo de estoque: GIV 323.598 linhas e Web 323.586 linhas consolidadas,
+  mas ambos com quantidade fisica/disponivel 2.368,00000; os dois produtos
+  que tinham residual (663123 e 663128) estao em zero;
+- historico de estoque: 60.645 linhas, quantidade 58.754,00000, sendo
+  30.082 entradas e 28.672 saidas nos dois bancos. No Web, as origens estao
+  distribuídas em 45.056 GIV-MOV, 13.765 BAL-GIV e 1.824 MANUAL-GIV;
+- historico de caixa: 10.512 linhas e R$ 19.477.928,21 nos dois bancos;
+- movimentos bancarios com chave: GIV 6.398 linhas e R$ 9.482.840,53,
+  preservados em 6.391 grupos Web; movimentos sem modelo: 1.767 linhas e
+  R$ 3.498.328,88; nao ha marcador bancario duplicado no Web.
+
+Esse snapshot comprova que a conversao dos dados atualmente modelados esta
+consistente. Ele nao transforma em "OK" os relatorios cuja fonte ou regra
+nao e equivalente: NF sintetica, modal financeiro de itens, rankings,
+compra-venda, giro, saldo historico, extrato com movimentos diretos,
+devolucoes/creditos e o titulo com vencimento 17/05/1818 continuam exigindo
+os ajustes descritos neste arquivo.
+
+Como verificação automatizada adicional, foram executadas 5 suites direcionadas
+das rotinas de NF de saida, contas a pagar, contas a receber, giro e
+demonstrativo de caixa: 35 testes, 34 aprovados e 1 falha. A falha e somente a
+expectativa antiga do teste de contas a receber que nao lista o status NG entre
+os status ignorados; o codigo atual inclui NG de forma intencional e os 717
+titulos NG do GIV estao fora do aberto. As outras quatro suites passaram sem
+falha.
+
+16. CONFERENCIA DAS 14 VARIACOES CONSOLIDADAS PELO WEB
+--------------------------------------------------------
+Foi feita uma segunda conferencia dos 14 registros de produto que foram
+pulados na insercao por ja existir no Web a mesma combinacao de familia,
+cor e tamanho. Todos os 14 possuem uma linha de preco no GIV e todos estao
+com estoque fisico/disponivel igual a zero no GIV.
+
+O de/para encontrado no Web foi:
+
+- 8221457 -> produto_filho 634965;
+- 8221512 -> produto_filho 635021;
+- 8241807 -> produto_filho 655315;
+- 8254197 -> produto_filho 667706;
+- 8261296 -> produto_filho 394166;
+- 8261297 -> produto_filho 394077;
+- 8263377 -> produto_filho 394264;
+- 8263622 -> produto_filho 394138;
+- 8263623 -> produto_filho 394139;
+- 8263842 -> produto_filho 394142;
+- 8263847 -> produto_filho 394145;
+- 8263868 -> produto_filho 394059;
+- 8263872 -> produto_filho 394060;
+- 8263877 -> produto_filho 394061.
+
+Em todos os 14 casos, os precos de compra, ultima compra, custo, custo
+medio, margem, venda e promocao conferidos no produto_filho Web sao iguais
+ao registro correspondente da tabela_preco_item do GIV. Portanto, esses
+"PULOS" nao significam item perdido: significam que a variacao ja estava
+representada por uma linha Web existente e foi reaproveitada para respeitar
+a restricao unica de familia/cor/tamanho.
+
+A diferenca agregada de precos que ainda aparece na conferencia geral nao
+significa que esses precos estejam ausentes do produto Web: ela representa a
+decisao de contar uma unica vez uma variacao natural que aparece duplicada no
+GIV, somada as duas raizes CAMISA COURO extras explicadas na secao 6. Se for
+exigido que a soma bruta de todas as linhas, incluindo duplicatas historicas,
+fique identica, sera necessario decidir uma regra de saneamento de cadastro;
+nao se deve corrigir isso na tela. Nenhuma alteracao no projeto_v1 foi feita.
+
+17. REVALIDACAO LIVE GERAL EM 08/08/2026
+-----------------------------------------
+Foi executada uma nova consulta somente leitura, em conexoes limpas, no
+escopo GIV cd_empresa=1 e Web tenant_id=8/cd_empresa=7. Os resultados atuais
+foram:
+
+- pedido_compra: 177 documentos e 1.949 itens; total dos documentos e bruto
+  dos itens R$ 889.703,71 nos dois bancos;
+- condicional/orcamento: 9.398 documentos e 66.908 itens; total dos
+  documentos R$ 29.696.643,51, quantidade 67.124 e bruto dos itens
+  R$ 56.847.809,61 nos dois bancos;
+- prevenda: 7.029 documentos e 20.153 itens; total R$ 12.673.553,93,
+  quantidade 20.368 e bruto dos itens R$ 15.528.346,88 nos dois bancos;
+- nota fiscal de entrada: 2.653 notas e 33.150 itens; nota R$ 10.605.163,70,
+  produto R$ 10.874.810,89, quantidade 37.560 e bruto dos itens
+  R$ 10.877.110,86 nos dois bancos;
+- nota fiscal de saida: 13.237 notas e 41.836 itens; total
+  R$ 23.031.705,62, quantidade 42.377 e bruto dos itens R$ 27.220.015,42
+  nos dois bancos;
+- contas a receber: 23.751 titulos; contas a pagar: 13.032 titulos;
+  as chaves e os valores permanecem iguais no escopo conferido;
+- contas a pagar em aberto: GIV 252 titulos/R$ 446.274,34 e Web 252
+  titulos/R$ 446.274,34; contas a receber em aberto: GIV/Web 187 titulos e
+  R$ 236.563,21. O mapeamento de status e GIV AB -> Web A;
+- saldo de estoque: 323.598 linhas GIV contra 323.586 Web, mas fisico e
+  disponivel somam quantidade 2.368,00 nos dois bancos. A diferenca de
+  linhas continua sendo a consolidacao de variacoes/raizes documentada nas
+  secoes 6 e 16;
+- valorizacao do saldo atual: venda R$ 2.643.066,82, custo R$ 990.593,68 e
+  custo medio R$ 960.168,92 nos dois bancos; nenhum produto Web com estoque
+  diferente de zero ficou sem preco;
+- historico de estoque: GIV/Web 60.645 linhas GIV marcadas e quantidade
+  58.754,00000;
+- historico de caixa: GIV/Web 10.512 linhas e R$ 19.477.928,21;
+  por tipo, GIV CX/E virou Web D (4/R$ 707.660,95), GIV RB virou Web R
+  (2.160/R$ 3.632.283,11), GIV CX/S virou Web S (1.015/R$ 2.884.999,71) e
+  GIV PV virou Web V (7.333/R$ 12.252.984,44), todos iguais;
+- banco: GIV 8.165 linhas e R$ 12.981.169,41; Web 6.391 grupos vinculados e
+  R$ 9.482.840,53. A diferenca restante e de 1.767 movimentos diretos/sem
+  titulo, R$ 3.498.328,88, sem tabela Web equivalente;
+- credito de cliente: GIV 1.471 movimentos e R$ 1.189.494,31; Web continua
+  sem itens de devolucao/credito equivalentes no tenant;
+- precos: 323.598 linhas GIV contra 323.586 Web. Os totais de compra,
+  ultima compra, venda, custo, custo medio e margem diferem respectivamente
+  em R$ -722,11, R$ -4.322,11, R$ -2.254,00, R$ -722,11,
+  R$ -4.096,07 e R$ -1.636,51. As 14 variacoes consolidadas, entretanto,
+  possuem de/para e precos iguais, conforme a secao 16.
+
+Na mesma data, a rodada direcionada de testes do projeto_v1 executou 5
+suites e 35 testes: 34 passaram e 1 falhou. A unica falha continua sendo a
+expectativa antiga do teste de contas a receber, que nao inclui NG na lista de
+status ignorados, embora o codigo atual e a regra do GIV tratem os 717 titulos
+NG como negociados e fora do aberto. As suites de NF de saida, contas a pagar,
+giro e demonstrativo de caixa passaram. O projeto_v1 permaneceu sem alteracao.
+
+Tambem foi repetida a comparacao por multiconjunto, preservando chaves
+duplicadas e normalizando a data/status: 2.653 NFs de entrada, 13.237 NFs de
+saida, 33.150 itens de entrada, 41.836 itens de saida, 13.032 titulos a pagar
+e 23.751 titulos a receber ficaram sem chave faltante, chave extra ou
+divergencia de valor. Para condicionais, cujo numero Web e uma sequence
+propria e nao o nr_orcamento GIV, a comparacao foi feita pela assinatura
+natural (cliente, data, total e quantidade): 9.398 documentos e seus
+agregados de itens tambem ficaram sem falta ou sobra.
+
+Na integridade referencial, nenhum item de pedido, condicional, prevenda,
+entrada ou saida ficou sem produto correspondente no Web, e nenhum titulo
+ficou sem fornecedor/cliente quando o vinculo era obrigatorio. Os cabecalhos
+sem itens tambem foram conferidos: 1 nota de entrada e 39 notas de saida sem
+itens existem nos dois bancos, com as mesmas chaves e valores; portanto nao
+sao itens perdidos pela conversao.
+
+A procedure GIV pr_rel_nota_fiscal_saida tambem foi executada novamente com
+empresa 1, periodo 01/01/1900 a 31/12/2099, tipo S, pessoa T, sem canceladas,
+todas as situacoes NFE e D1 habilitado. Ela retornou 40.728 linhas, quantidade
+41.214, produto R$ 22.325.208,62 e nota R$ 22.338.439,81. O Web continua com
+13.076 cabecalhos nao cancelados e R$ 22.567.644,40 no sintetico. A diferenca
+permanece confirmada como regra de procedure/filtro/formula, nao conversao de
+documentos ou itens.
+
+Como referencia adicional, a consulta Web item a item com a formula financeira
+completa, sem canceladas, retornou 13.037 notas distintas, quantidade 41.194
+e R$ 22.309.345,01. Isso nao deve ser confundido com o sintetico: o sintetico
+soma o cabecalho, enquanto a procedure GIV aplica sua propria selecao e
+agregacao de itens.
+
+Esta revalidacao confirma que os dados atualmente modelados e carregados no
+Web permanecem consistentes. Ela tambem confirma que ainda nao e correto
+declarar que todos os relatorios batem: a paridade dos relatorios historicos
+depende dos movimentos bancarios diretos, creditos/devolucoes, credito de
+fornecedor, fonte de vendas e regras de calculo/filtro listadas neste TXT.
+Nenhum arquivo do projeto_v1 foi alterado.
+
+18. CHECKLIST FINAL DE ACEITE DA AUDITORIA
+-------------------------------------------
+O aceite abaixo separa a carga de dados da paridade funcional dos relatorios:
+
+CONVERSAO DOS DADOS MODELADOS
+
+- documentos, itens e titulos: OK; comparacao por multiconjunto sem faltas,
+  sobras ou divergencias de valor;
+- produtos, variacoes, precos e estoque: OK operacionalmente; as diferencas
+  estruturais de cardinalidade e preco estao explicadas por consolidacao de
+  duplicidades e duas raizes CAMISA COURO extras;
+- integridade referencial: OK; nenhum item ficou sem produto e os vinculos de
+  cliente/fornecedor obrigatorios foram resolvidos;
+- estoque atual: OK; quantidade e valorizacao de venda/custo/custo medio
+  iguais;
+- historico de estoque: OK; 60.645 movimentos e quantidade 58.754,00000;
+- historico de caixa: OK; 10.512 movimentos, R$ 19.477.928,21 e tipos
+  D/R/S/V conferidos;
+- movimentos bancarios vinculados a titulos: OK no recorte carregado;
+  6.391 grupos, R$ 9.482.840,53, sem duplicidade;
+- contas a receber/pagar: OK nos totais e titulos; a diferenca visual do
+  pagar e somente a regra do vencimento 17/05/1818.
+
+PARIDADE DOS RELATORIOS
+
+- NF de entrada/saida no banco: OK; a tela de detalhe ainda precisa aplicar a
+  formula liquida dos itens;
+- NF de saida sintetica: PENDENTE; procedure GIV e Web usam filtros,
+  granularidade e formula diferentes;
+- contas a receber e recebimento de crediario: OK nos recortes conferidos;
+- contas a pagar: PARCIAL; dashboard inclui o titulo de 1818 e a lista aplica
+  regra diferente para datas historicas;
+- demonstrativo de caixa: PARCIAL; o historico carregado bate, mas creditos/
+  devolucoes e a regra de detalhe precisam de modelo equivalente;
+- extrato bancario: PARCIAL; movimentos diretos sem titulo, R$ 3.498.328,88,
+  ainda nao possuem tabela Web generica;
+- rankings, giro e compra/venda: PENDENTE; GIV usa pedido_venda e creditos
+  legados, enquanto Web usa prevenda e devolucao; a formula Web tambem
+  multiplica descontos/acrescimos que ja sao totais de linha;
+- credito/devolucao de cliente: PENDENTE; 1.471 movimentos GIV sem de/para
+  seguro no modelo Web;
+- credito de fornecedor: PENDENTE; 840 movimentos GIV e nenhuma tabela Web
+  equivalente;
+- caixa_status/caixa_fechamento: FORA DO ESCOPO por decisao expressa do
+  usuario;
+- procedures GIV sem rota Web: FORA DO ESCOPO FUNCIONAL, nao sao falha da
+  conversao dos dados que possuem destino.
+
+VEREDITO
+
+A conversao dos dados que possuem modelo Web foi validada e esta consistente.
+O objetivo de fazer todos os relatorios baterem ainda nao esta concluido:
+existem pendencias comprovadas de regra de tela, fonte de vendas e modelo de
+historico. O projeto_v1 deve ser ajustado conforme as secoes anteriores antes
+de um novo aceite de paridade total. Nenhum arquivo do projeto_v1 foi alterado.
 
 Fim do relatorio.

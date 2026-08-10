@@ -127,7 +127,9 @@ TABLE_OPTIONS = [
     ("23", "banco_conta", "banco_conta"),
     ("16", "condicao_pagamento", "condicao_pagamento"),
     ("25", "cartao_administradora", "cartao_administradora"),
+    ("26", "operacao_estoque", "operacao_estoque (historico)"),
     ("14", "produto", "produto"),
+    ("27", "movimento_estoque", "movimento_estoque (historico de saldo/giro)"),
     ("24", "condicional", "condicional"),
     ("17", "pedido_compra", "pedido_compra"),
     ("18", "nota_fiscal_entrada", "nota_fiscal_entrada"),
@@ -135,6 +137,8 @@ TABLE_OPTIONS = [
     ("20", "nota_fiscal_saida", "nota_fiscal_saida"),
     ("21", "titulo_receber", "titulo_receber"),
     ("22", "titulo_pagar", "titulo_pagar"),
+    ("28", "caixa_movimentacao", "caixa_movto -> caixa_movimentacao (historico)"),
+    ("29", "movimento_bancario", "banco_movto -> movimentos bancarios dos titulos"),
 ]
 
 TABLE_ORDER = {key: idx for idx, (_number, key, _label) in enumerate(TABLE_OPTIONS)}
@@ -163,6 +167,16 @@ DEPENDENCIES = {
     "titulo_pagar": ("fornecedor", "usuario", "condicao_pagamento", "banco", "nota_fiscal_entrada"),
     "banco_conta": ("banco",),
     "condicional": ("cliente", "usuario", "produto"),
+    "movimento_estoque": ("operacao_estoque", "produto", "usuario"),
+    "caixa_movimentacao": ("cliente", "usuario"),
+    "movimento_bancario": (
+        "cliente",
+        "fornecedor",
+        "usuario",
+        "banco_conta",
+        "titulo_receber",
+        "titulo_pagar",
+    ),
 }
 
 REVERTER_DEPENDENTS = {}
@@ -197,6 +211,7 @@ REVERTER_DIRECT_TABLE_KEYS = {
     "condicao_pagto_forma": "condicao_pagamento",
     "forma_pagamento": "condicao_pagamento",
     "cartao_administradora": "cartao_administradora",
+    "operacao_estoque": "operacao_estoque",
     "produto": "produto",
     "produto_info": "produto",
     "produto_filho": "produto",
@@ -205,6 +220,9 @@ REVERTER_DIRECT_TABLE_KEYS = {
     "produto_estoque": "produto",
     "produto_local_estoque": "produto",
     "movimento_estoque": "produto",
+    "caixa_movimentacao": "caixa_movimentacao",
+    "titulo_receber_movimento_bancario": "movimento_bancario",
+    "titulo_pagar_movimento_bancario": "movimento_bancario",
     "inventario_estoque_item": "produto",
     "orcamento_item": "produto",
     "condicional": "condicional",
@@ -243,6 +261,8 @@ REVERTER_SEQUENCE_KEYS = {
     "condicao_pagto": "condicao_pagamento",
     "forma_pagamento": "condicao_pagamento",
     "cartao_administradora": "cartao_administradora",
+    "operacao_estoque": "operacao_estoque",
+    "movimento_estoque": "movimento_estoque",
     "produto": "produto",
     "condicional": "condicional",
     "pedido_compra": "pedido_compra",
@@ -803,7 +823,7 @@ class ConverterGUI(tk.Tk):
             bg=UI["surface"],
             highlightthickness=0,
             bd=0,
-            width=230,
+            width=360,
         )
         list_scroll = ttk.Scrollbar(list_outer, orient="vertical", command=list_canvas.yview)
         list_canvas.configure(yscrollcommand=list_scroll.set)
@@ -829,10 +849,9 @@ class ConverterGUI(tk.Tk):
         for idx, (number, key, label) in enumerate(TABLE_OPTIONS):
             var = tk.BooleanVar(value=False)
             self.table_vars[key] = (number, var)
-            numero_visual = idx + 1
             chk = ttk.Checkbutton(
                 list_frame,
-                text=f"{numero_visual} - {label}",
+                text=f"{number} - {label}",
                 variable=var,
                 command=self.update_selected_count,
             )

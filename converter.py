@@ -14,6 +14,7 @@ import getpass
 import os
 import re
 import time
+import traceback
 import unicodedata
 from collections import defaultdict
 from decimal import Decimal
@@ -136,6 +137,7 @@ ADMIN_LOGIN_PADRAO = "admin"
 ADMIN_SENHA_PADRAO = "admin123"
 TAMANHO_LOTE_PRODUTO = 300
 TAMANHO_BLOCO_SEQUENCE_PRODUTO = 5000
+TAMANHO_LOTE_ESTOQUE_RECONCILIACAO = 2000
 LOG_PRODUTO_INTERVALO_REGISTROS = 1000
 LOG_PRODUTO_INTERVALO_SEGUNDOS = 5
 AUXILIARES_PRODUTO = (
@@ -163,7 +165,9 @@ TABELAS_DISPONIVEIS = (
     "banco_conta",
     "condicao_pagamento",
     "cartao_administradora",
+    "operacao_estoque",
     "produto",
+    "movimento_estoque",
     "condicional",
     "pedido_compra",
     "nota_fiscal_entrada",
@@ -171,6 +175,8 @@ TABELAS_DISPONIVEIS = (
     "nota_fiscal_saida",
     "titulo_receber",
     "titulo_pagar",
+    "caixa_movimentacao",
+    "movimento_bancario",
 )
 DEPENDENCIAS_PROCESSAMENTO = {
     "sub_grupo": ("grupo",),
@@ -196,6 +202,9 @@ DEPENDENCIAS_PROCESSAMENTO = {
     "nota_fiscal_saida": ("cliente", "usuario", "condicao_pagamento", "produto"),
     "titulo_receber": ("cliente", "usuario", "condicao_pagamento", "nota_fiscal_saida"),
     "titulo_pagar": ("fornecedor", "usuario", "condicao_pagamento", "banco", "nota_fiscal_entrada"),
+    "movimento_estoque": ("operacao_estoque", "produto", "usuario"),
+    "caixa_movimentacao": ("cliente", "usuario"),
+    "movimento_bancario": ("cliente", "fornecedor", "usuario", "banco_conta", "titulo_receber", "titulo_pagar"),
 }
 ROTINAS_COM_PRODUTO = {
     "condicional",
@@ -221,7 +230,9 @@ NOMES_TABELAS_LOG = {
     "banco_conta": "banco_conta",
     "condicao_pagamento": "condicao_pagamento",
     "cartao_administradora": "cartao_administradora",
+    "operacao_estoque": "operacao_estoque",
     "produto": "produto",
+    "movimento_estoque": "movimento_estoque",
     "condicional": "condicional",
     "pedido_compra": "pedido_compra",
     "nota_fiscal_entrada": "nota_fiscal_entrada",
@@ -229,6 +240,8 @@ NOMES_TABELAS_LOG = {
     "nota_fiscal_saida": "nota_fiscal_saida",
     "titulo_receber": "titulo_receber",
     "titulo_pagar": "titulo_pagar",
+    "caixa_movimentacao": "caixa_movimentacao",
+    "movimento_bancario": "movimento_bancario",
 }
 
 
@@ -4060,7 +4073,7 @@ def processar_fornecedores(
     cd_empresa_giv=None
 ):
     print()
-    print("[INFO] Fornecedor: registros existentes no Web nao serao usados para pular a importacao.")
+    print("[INFO] Fornecedor: registros ja ligados ao GIV serao reaproveitados no mesmo tenant.")
     if cd_empresa_giv is not None and tabela_giv_tem_coluna(cursor_giv, 'fornecedor', 'cd_empresa'):
         print(f"[INFO] Fornecedor: filtrando origem GIV por cd_empresa={cd_empresa_giv}.")
 
@@ -4082,10 +4095,28 @@ def processar_fornecedores(
     fornecedores_giv = buscar_fornecedores_giv(cursor_giv, cd_empresa_giv)
     print(f"[OK] {len(fornecedores_giv)} fornecedores encontrados no GIV.")
 
+    mapa_fornecedores_existentes = buscar_mapa_fornecedor_produto(
+        cursor_giv,
+        cursor_web,
+        tabela_web_fornecedor,
+        tenant_id,
+        cd_empresa_giv
+    )
     fornecedores_web = []
     pulados = 0
-    codigos_fornecedor = iter(reservar_valores_sequence(cursor_web, sequence_fornecedor, len(fornecedores_giv)))
+    fornecedores_pendentes = []
     for reg in fornecedores_giv:
+        cd_fornecedor_giv = reg.get('cd_fornecedor')
+        cd_fornecedor_existente = mapa_fornecedores_existentes.get(cd_fornecedor_giv)
+        if cd_fornecedor_existente is None:
+            cd_fornecedor_existente = mapa_fornecedores_existentes.get(normalizar_codigo_cidade(cd_fornecedor_giv))
+        if cd_fornecedor_existente is not None:
+            pulados += 1
+            continue
+        fornecedores_pendentes.append(reg)
+
+    codigos_fornecedor = iter(reservar_valores_sequence(cursor_web, sequence_fornecedor, len(fornecedores_pendentes)))
+    for reg in fornecedores_pendentes:
         cd_fornecedor_web = next(codigos_fornecedor)
         fornecedores_web.append(
             converter_fornecedor(
@@ -4106,8 +4137,8 @@ def processar_fornecedores(
             numeros_ausentes += 1
 
     print(
-        f"[OK] {len(fornecedores_web)} fornecedores para inserir "
-        f"(nenhum fornecedor foi pulado por ja existir no Web)."
+        f"[OK] {len(fornecedores_web)} fornecedores para inserir; "
+        f"{pulados} fornecedores reaproveitados por documento/nome."
     )
     if numeros_extraidos:
         print(
@@ -4249,10 +4280,32 @@ def processar_usuarios(cursor_giv, cursor_web, tabela_web_usuario, cidades_giv, 
     usuarios_giv = buscar_usuarios_giv(cursor_giv, cd_empresa_giv)
     print(f"[OK] {len(usuarios_giv)} usuarios encontrados no GIV (0 e 1 ignorados).")
 
+    mapa_usuarios_existentes, _ = carregar_mapa_usuario_rotinas(
+        cursor_giv,
+        cursor_web,
+        tabela_web_usuario,
+        tenant_id,
+        cd_empresa,
+        cd_empresa_giv
+    )
     usuarios_web = []
     mapa_usuarios = {}
-    codigos_usuario = iter(reservar_valores_sequence(cursor_web, sequence_usuario, len(usuarios_giv)))
+    usuarios_pendentes = []
+    pulados = 0
     for reg in usuarios_giv:
+        cd_usuario_giv = reg.get('cd_usuario')
+        cd_usuario_existente = mapa_usuarios_existentes.get(cd_usuario_giv)
+        if cd_usuario_existente is None:
+            cd_usuario_existente = mapa_usuarios_existentes.get(normalizar_codigo_cidade(cd_usuario_giv))
+        if cd_usuario_existente is not None:
+            mapa_usuarios[cd_usuario_giv] = cd_usuario_existente
+            mapa_usuarios[normalizar_codigo_cidade(cd_usuario_giv)] = cd_usuario_existente
+            pulados += 1
+            continue
+        usuarios_pendentes.append(reg)
+
+    codigos_usuario = iter(reservar_valores_sequence(cursor_web, sequence_usuario, len(usuarios_pendentes)))
+    for reg in usuarios_pendentes:
         cd_usuario_web = next(codigos_usuario)
         usuarios_web.append(
             converter_usuario(
@@ -4265,8 +4318,9 @@ def processar_usuarios(cursor_giv, cursor_web, tabela_web_usuario, cidades_giv, 
             )
         )
         mapa_usuarios[reg.get('cd_usuario')] = cd_usuario_web
+        mapa_usuarios[normalizar_codigo_cidade(reg.get('cd_usuario'))] = cd_usuario_web
 
-    print(f"[OK] {len(usuarios_web)} usuarios para inserir.")
+    print(f"[OK] {len(usuarios_web)} usuarios para inserir; {pulados} reaproveitados por nome/login.")
     aplicar_limites_texto_web(cursor_web, tabela_web_usuario, usuarios_web, 'usuario')
 
     inseridos, erros, erros_detalhe = inserir_registros_web(
@@ -4293,7 +4347,7 @@ def processar_usuarios(cursor_giv, cursor_web, tabela_web_usuario, cidades_giv, 
         'tabela': 'usuario',
         'lidos': len(usuarios_giv),
         'inseridos': inseridos,
-        'existentes': 0,
+        'existentes': pulados,
         'erros': erros,
         'erros_detalhe': erros_detalhe,
         'mapa_usuarios': mapa_usuarios_ok,
@@ -4639,7 +4693,7 @@ def processar_clientes(
     cd_empresa_giv=None
 ):
     print()
-    print("[INFO] Cliente: registros existentes no Web nao serao usados para pular a importacao.")
+    print("[INFO] Cliente: registros ja ligados ao GIV serao reaproveitados no tenant/empresa.")
     if cd_empresa_giv is not None:
         print(f"[INFO] Cliente: filtrando origem GIV por cd_empresa={cd_empresa_giv}.")
 
@@ -4669,11 +4723,32 @@ def processar_clientes(
     if ddd_por_cidade:
         print(f"[OK] DDD inferido para {len(ddd_por_cidade)} cidades a partir dos telefones do GIV.")
 
+    mapa_clientes_existentes = carregar_mapa_cliente_rotinas(
+        cursor_giv,
+        cursor_web,
+        tabela_web_cliente,
+        tenant_id,
+        cd_empresa,
+        cd_empresa_giv
+    )
     clientes_web = []
     pulados = 0
     usuarios_anulados = 0
-    codigos_cliente = iter(reservar_valores_sequence(cursor_web, sequence_cliente, len(clientes_giv)))
+    clientes_pendentes = []
     for reg in clientes_giv:
+        chave_cliente = (reg.get('cd_empresa'), reg.get('cd_cliente'))
+        cd_cliente_existente = mapa_clientes_existentes.get(chave_cliente)
+        if cd_cliente_existente is None:
+            cd_cliente_existente = mapa_clientes_existentes.get(reg.get('cd_cliente'))
+        if cd_cliente_existente is None:
+            cd_cliente_existente = mapa_clientes_existentes.get(normalizar_codigo_cidade(reg.get('cd_cliente')))
+        if cd_cliente_existente is not None:
+            pulados += 1
+            continue
+        clientes_pendentes.append(reg)
+
+    codigos_cliente = iter(reservar_valores_sequence(cursor_web, sequence_cliente, len(clientes_pendentes)))
+    for reg in clientes_pendentes:
         cd_cliente_web = next(codigos_cliente)
         cliente = converter_cliente(
             reg,
@@ -4695,7 +4770,7 @@ def processar_clientes(
             cliente['cd_usuario'] = None
         clientes_web.append(cliente)
 
-    print(f"[OK] {len(clientes_web)} clientes para inserir (nenhum cliente foi pulado por ja existir no Web).")
+    print(f"[OK] {len(clientes_web)} clientes para inserir; {pulados} reaproveitados por documento/nome.")
     if usuarios_anulados:
         print(f"[AVISO] {usuarios_anulados} clientes estavam com cd_usuario inexistente no Web; cd_usuario ficou NULL.")
 
@@ -6056,7 +6131,9 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
             {quote_identificador('ds_produto')},
             {quote_identificador('cd_produto_barra_ean')},
             {quote_identificador('cd_referencia')},
-            {quote_identificador('cd_grade')}
+            {quote_identificador('cd_grade')},
+            {quote_identificador('cd_cor')},
+            {quote_identificador('cd_tamanho')}
           FROM {tabelas_web['produto_info']}
          WHERE {quote_identificador('tenant_id')} = %s
         """,
@@ -6066,8 +6143,10 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
     por_barcode = {}
     por_referencia = {}
     por_referencia_nome = {}
+    por_referencia_nome_dimensoes = {}
+    por_nome_dimensoes = {}
     grade_por_produto = {}
-    for cd_produto, ds_produto, barcode, cd_referencia, cd_grade in cursor_web.fetchall():
+    for cd_produto, ds_produto, barcode, cd_referencia, cd_grade, cd_cor, cd_tamanho in cursor_web.fetchall():
         chave = chave_texto(ds_produto)
         if chave:
             por_nome.setdefault(chave, set()).add(cd_produto)
@@ -6079,6 +6158,24 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
             por_referencia.setdefault(referencia, set()).add(cd_produto)
             if chave:
                 por_referencia_nome.setdefault((referencia, chave), set()).add(cd_produto)
+                por_referencia_nome_dimensoes.setdefault(
+                    (
+                        referencia,
+                        chave,
+                        normalizar_codigo_cidade(cd_cor),
+                        normalizar_codigo_cidade(cd_tamanho),
+                    ),
+                    set()
+                ).add(cd_produto)
+        if chave:
+            por_nome_dimensoes.setdefault(
+                (
+                    chave,
+                    normalizar_codigo_cidade(cd_cor),
+                    normalizar_codigo_cidade(cd_tamanho),
+                ),
+                set()
+            ).add(cd_produto)
         grade_por_produto[cd_produto] = cd_grade
 
     cursor_web.execute(
@@ -6123,10 +6220,20 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
     por_barcode_ok = 0
     por_referencia_ok = 0
     por_nome_ok = 0
+    por_dimensoes_ok = 0
     filhos_barcode_ok = 0
     pais_por_filho_ok = 0
     filhos_grade_ok = 0
     ambiguos = 0
+    raizes_web_mapeados = set()
+    filhos_web_mapeados = set()
+
+    def escolher_raiz_por_dimensoes(candidatos):
+        """Escolhe uma raiz ainda nao usada, sem colapsar produtos distintos."""
+        if not candidatos:
+            return None
+        disponiveis = sorted(cd for cd in candidatos if cd not in raizes_web_mapeados)
+        return disponiveis[0] if disponiveis else None
 
     raizes = [reg for reg in produtos_giv if classificacao[reg.get('cd_produto')]['eh_raiz']]
     filhos = [reg for reg in produtos_giv if classificacao[reg.get('cd_produto')]['eh_filho']]
@@ -6136,6 +6243,8 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
         barcode = somente_digitos(barcodes_giv.get(cd_origem))
         referencia = chave_texto(produto.get('cd_referencia'))
         nome = chave_texto(produto.get('ds_produto'))
+        cd_cor_web = valor_mapa_ou_padrao(mapas.get('cor', {}), produto.get('cd_cor'))
+        cd_tamanho_web = valor_mapa_ou_padrao(mapas.get('tamanho', {}), produto.get('cd_tamanho'))
         cd_web = None
 
         candidatos_barcode = por_barcode.get(barcode) if barcode else None
@@ -6143,6 +6252,29 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
             cd_web = next(iter(candidatos_barcode))
             por_barcode_ok += 1
         else:
+            candidatos_referencia_nome_dimensoes = (
+                por_referencia_nome_dimensoes.get(
+                    (
+                        referencia,
+                        nome,
+                        normalizar_codigo_cidade(cd_cor_web),
+                        normalizar_codigo_cidade(cd_tamanho_web),
+                    )
+                )
+                if referencia and nome
+                else None
+            )
+            candidatos_nome_dimensoes = (
+                por_nome_dimensoes.get(
+                    (
+                        nome,
+                        normalizar_codigo_cidade(cd_cor_web),
+                        normalizar_codigo_cidade(cd_tamanho_web),
+                    )
+                )
+                if nome
+                else None
+            )
             candidatos_referencia_nome = (
                 por_referencia_nome.get((referencia, nome))
                 if referencia and nome
@@ -6150,15 +6282,35 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
             )
             candidatos_referencia = por_referencia.get(referencia) if referencia else None
             candidatos_nome = por_nome.get(nome) if nome else None
-            if candidatos_referencia_nome and len(candidatos_referencia_nome) == 1:
-                cd_web = next(iter(candidatos_referencia_nome))
-                por_referencia_ok += 1
-            elif candidatos_referencia and len(candidatos_referencia) == 1:
-                cd_web = next(iter(candidatos_referencia))
-                por_referencia_ok += 1
-            elif candidatos_nome and len(candidatos_nome) == 1:
-                cd_web = next(iter(candidatos_nome))
-                por_nome_ok += 1
+            if candidatos_referencia_nome_dimensoes:
+                # A combinacao referencia + nome + cor + tamanho identifica a
+                # raiz melhor que referencia/nome sozinhos. Se o Web ja tiver
+                # duplicatas antigas dessa mesma chave, reutiliza cada uma uma
+                # unica vez e de forma deterministica para que a conversao nao
+                # crie outra raiz quando ja houver candidato disponivel.
+                cd_web = escolher_raiz_por_dimensoes(candidatos_referencia_nome_dimensoes)
+                if cd_web is not None:
+                    por_dimensoes_ok += 1
+            elif candidatos_nome_dimensoes:
+                # O GIV pode ter varios produtos com o mesmo nome, cor e
+                # tamanho, sem referencia nem barcode. Em uma carga repetida
+                # os candidatos formam uma fila deterministica; reaproveita
+                # cada Web uma unica vez na ordem do codigo.
+                cd_web = escolher_raiz_por_dimensoes(candidatos_nome_dimensoes)
+                if cd_web is not None:
+                    por_dimensoes_ok += 1
+            elif candidatos_referencia_nome:
+                cd_web = escolher_raiz_por_dimensoes(candidatos_referencia_nome)
+                if cd_web is not None:
+                    por_referencia_ok += 1
+            elif candidatos_referencia:
+                cd_web = escolher_raiz_por_dimensoes(candidatos_referencia)
+                if cd_web is not None:
+                    por_referencia_ok += 1
+            elif candidatos_nome:
+                cd_web = escolher_raiz_por_dimensoes(candidatos_nome)
+                if cd_web is not None:
+                    por_nome_ok += 1
             elif candidatos_barcode or candidatos_referencia_nome or candidatos_referencia or candidatos_nome:
                 ambiguos += 1
 
@@ -6166,6 +6318,7 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
             mapa[cd_origem] = cd_web
             mapa[normalizar_codigo_cidade(cd_origem)] = cd_web
             grade_por_pai[cd_web] = grade_por_produto.get(cd_web)
+            raizes_web_mapeados.add(cd_web)
 
     for produto in filhos:
         cd_origem = produto.get('cd_produto')
@@ -6173,8 +6326,13 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
         cd_web = None
 
         candidatos_barcode = filhos_por_barcode.get(barcode) if barcode else None
-        if candidatos_barcode and len(candidatos_barcode) == 1:
-            cd_web, cd_pai_web, _cd_cor_web, _cd_tamanho_web = next(iter(candidatos_barcode))
+        candidatos_barcode_disponiveis = sorted(
+            candidato
+            for candidato in (candidatos_barcode or ())
+            if candidato[0] not in filhos_web_mapeados
+        )
+        if candidatos_barcode_disponiveis:
+            cd_web, cd_pai_web, _cd_cor_web, _cd_tamanho_web = candidatos_barcode_disponiveis[0]
             filhos_barcode_ok += 1
             cd_pai_giv = produto.get('cd_produto_pai')
             if cd_pai_giv is not None and cd_pai_web is not None and cd_pai_giv not in mapa:
@@ -6191,8 +6349,13 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
                 if cd_pai_web is not None and cd_cor_web is not None and cd_tamanho_web is not None
                 else None
             )
-            if candidatos_grade and len(candidatos_grade) == 1:
-                cd_web = next(iter(candidatos_grade))
+            candidatos_grade_disponiveis = sorted(
+                candidato
+                for candidato in (candidatos_grade or ())
+                if candidato not in filhos_web_mapeados
+            )
+            if candidatos_grade_disponiveis:
+                cd_web = candidatos_grade_disponiveis[0]
                 filhos_grade_ok += 1
             elif candidatos_barcode or candidatos_grade:
                 ambiguos += 1
@@ -6200,12 +6363,14 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
         if cd_web is not None:
             mapa[cd_origem] = cd_web
             mapa[normalizar_codigo_cidade(cd_origem)] = cd_web
+            filhos_web_mapeados.add(cd_web)
 
     chaves_giv = {chave for chave in mapa if isinstance(chave, int)}
     print(
         f"[OK] Produtos ja existentes no tenant: {len(set(mapa.values()))} Web / "
         f"{len(chaves_giv)} GIV mapeados "
         f"(raiz: {por_barcode_ok} barcode, {por_referencia_ok} referencia, {por_nome_ok} nome; "
+        f"{por_dimensoes_ok} por referencia/nome+cor+tamanho; "
         f"filhos: {filhos_barcode_ok} barcode, {filhos_grade_ok} pai+cor+tamanho; "
         f"pais inferidos por filho={pais_por_filho_ok}; "
         f"{ambiguos} ambiguos)."
@@ -6213,17 +6378,82 @@ def carregar_mapa_produto_existente_tenant(cursor_web, tabelas_web, tenant_id, p
     return mapa, grade_por_pai
 
 
-def carregar_produtos_com_estoque_web(cursor_web, tabela_web_produto_estoque, tenant_id, cd_empresa):
+def carregar_estoques_web_por_produto(cursor_web, tabela_web_produto_estoque, tenant_id, cd_empresa):
+    campos = [
+        'id_status',
+        'qt_fisico',
+        'qt_disponivel',
+        'qt_reservado',
+        'qt_transito',
+        'qt_pendente',
+        'qt_especial',
+        'qt_minimo_compra',
+        'qt_maximo_compra',
+        'qt_minimo_reposicao',
+        'qt_maximo_reposicao',
+    ]
     cursor_web.execute(
         f"""
-        SELECT {quote_identificador('cd_produto')}
+        SELECT {quote_identificador('cd_produto')},
+               {', '.join(quote_identificador(campo) for campo in campos)}
           FROM {tabela_web_produto_estoque}
          WHERE {quote_identificador('tenant_id')} = %s
            AND {quote_identificador('cd_empresa')} = %s
         """,
         (tenant_id, cd_empresa)
     )
-    return {row[0] for row in cursor_web.fetchall()}
+    return {
+        row[0]: dict(zip(campos, row[1:]))
+        for row in cursor_web.fetchall()
+    }
+
+
+def carregar_estoques_web_por_produtos(
+    cursor_web,
+    tabela_web_produto_estoque,
+    tenant_id,
+    cd_empresa,
+    cd_produtos
+):
+    """Carrega estoques somente para um lote de produtos.
+
+    O conversor roda em Python 32-bit por causa do ODBC do GIV. Carregar todos
+    os estoques Web e todos os estoques GIV ao mesmo tempo estoura memoria em
+    uma carga integral; a consulta em lotes conserva a mesma comparacao sem
+    duplicar centenas de milhares de dicionarios.
+    """
+    if not cd_produtos:
+        return {}
+
+    campos = [
+        'id_status',
+        'qt_fisico',
+        'qt_disponivel',
+        'qt_reservado',
+        'qt_transito',
+        'qt_pendente',
+        'qt_especial',
+        'qt_minimo_compra',
+        'qt_maximo_compra',
+        'qt_minimo_reposicao',
+        'qt_maximo_reposicao',
+    ]
+    placeholders = ', '.join('%s' for _ in cd_produtos)
+    cursor_web.execute(
+        f"""
+        SELECT {quote_identificador('cd_produto')},
+               {', '.join(quote_identificador(campo) for campo in campos)}
+          FROM {tabela_web_produto_estoque}
+         WHERE {quote_identificador('tenant_id')} = %s
+           AND {quote_identificador('cd_empresa')} = %s
+           AND {quote_identificador('cd_produto')} IN ({placeholders})
+        """,
+        (tenant_id, cd_empresa, *cd_produtos)
+    )
+    return {
+        row[0]: dict(zip(campos, row[1:]))
+        for row in cursor_web.fetchall()
+    }
 
 
 def inserir_estoque_produtos_reaproveitados(
@@ -6236,53 +6466,187 @@ def inserir_estoque_produtos_reaproveitados(
     cd_empresa,
     limites
 ):
-    existentes_estoque = carregar_produtos_com_estoque_web(
-        cursor_web,
-        tabelas_web['produto_estoque'],
-        tenant_id,
-        cd_empresa
-    )
-    registros = []
-    produtos_web_processados = set()
-    for produto in produtos_giv:
-        cd_giv = produto.get('cd_produto')
-        cd_web = mapa_produtos.get(cd_giv)
-        if cd_web is None or cd_web in produtos_web_processados:
-            continue
-        produtos_web_processados.add(cd_web)
-        if cd_web in existentes_estoque:
-            continue
-        estoque = converter_produto_estoque(
-            estoques_por_produto.get(cd_giv),
-            cd_web,
-            tenant_id,
-            cd_empresa
-        )
-        aplicar_limites_texto_registro(estoque, limites.get('produto_estoque'))
-        registros.append(estoque)
+    campos_estoque = [
+        'id_status',
+        'qt_fisico',
+        'qt_disponivel',
+        'qt_reservado',
+        'qt_transito',
+        'qt_pendente',
+        'qt_especial',
+        'qt_minimo_compra',
+        'qt_maximo_compra',
+        'qt_minimo_reposicao',
+        'qt_maximo_reposicao',
+    ]
+    # Um mesmo produto Web pode receber mais de um codigo GIV quando a origem
+    # possui variacoes que se tornam iguais depois do de/para de cor/tamanho.
+    # Mantemos um unico registro por produto Web e denunciamos valores de saldo
+    # conflitantes em vez de somar ou escolher silenciosamente outro saldo.
+    # O processamento e em lotes porque o executavel e 32-bit e o tenant atual
+    # possui mais de 323 mil produtos.
+    primeiro_giv_por_web = {}
+    conflitos = []
+    existentes_total = 0
+    inseridos_total = 0
+    erros_total = 0
+    atualizados_total = 0
+    erros_detalhe_total = []
+    total_lidos = 0
 
-    inseridos, erros, erros_detalhe = inserir_registros_web(
-        cursor_web,
-        tabelas_web['produto_estoque'],
-        registros,
-        'cd_produto',
-        'sp_produto_estoque_reaproveitado'
+    set_sql = ', '.join(
+        f"{quote_identificador(campo)} = %s"
+        for campo in campos_estoque
     )
-    existentes = len(produtos_web_processados) - len(registros)
-    if produtos_web_processados:
+    sql_atualizacao = f"""
+        UPDATE {tabelas_web['produto_estoque']}
+           SET {set_sql}
+         WHERE {quote_identificador('tenant_id')} = %s
+           AND {quote_identificador('cd_empresa')} = %s
+           AND {quote_identificador('cd_produto')} = %s
+    """
+
+    total_produtos = len(produtos_giv)
+    for inicio_lote, lote in lotes(produtos_giv, TAMANHO_LOTE_ESTOQUE_RECONCILIACAO):
+        estoques_por_web = {}
+        for produto in lote:
+            cd_giv = produto.get('cd_produto')
+            cd_web = mapa_produtos.get(cd_giv)
+            if cd_web is None:
+                continue
+
+            estoque = converter_produto_estoque(
+                estoques_por_produto.get(cd_giv),
+                cd_web,
+                tenant_id,
+                cd_empresa
+            )
+            aplicar_limites_texto_registro(estoque, limites.get('produto_estoque'))
+            primeiro_cd_giv = primeiro_giv_por_web.get(cd_web)
+            if primeiro_cd_giv is not None:
+                estoque_anterior = converter_produto_estoque(
+                    estoques_por_produto.get(primeiro_cd_giv),
+                    cd_web,
+                    tenant_id,
+                    cd_empresa
+                )
+                aplicar_limites_texto_registro(
+                    estoque_anterior,
+                    limites.get('produto_estoque')
+                )
+                if any(
+                    valor_decimal_ou_zero(estoque_anterior.get(campo))
+                    != valor_decimal_ou_zero(estoque.get(campo))
+                    for campo in campos_estoque[1:]
+                ) or valor_flag(estoque_anterior.get('id_status'), '') != valor_flag(estoque.get('id_status'), ''):
+                    conflitos.append(
+                        f"cd_produto_web={cd_web}: cd_produto_giv={cd_giv} "
+                        "possui saldo diferente de outro codigo GIV reaproveitado"
+                    )
+                continue
+
+            primeiro_giv_por_web[cd_web] = cd_giv
+            estoques_por_web[cd_web] = estoque
+
+        if not estoques_por_web:
+            continue
+
+        total_lidos += len(estoques_por_web)
+        estoques_web = carregar_estoques_web_por_produtos(
+            cursor_web,
+            tabelas_web['produto_estoque'],
+            tenant_id,
+            cd_empresa,
+            list(estoques_por_web)
+        )
+
+        registros = []
+        atualizacoes = []
+        existentes_lote = 0
+        for cd_web, estoque in estoques_por_web.items():
+            atual = estoques_web.get(cd_web)
+            if atual is None:
+                registros.append(estoque)
+                continue
+
+            existentes_lote += 1
+            diferente = (
+                valor_flag(atual.get('id_status'), '') != valor_flag(estoque.get('id_status'), '')
+                or any(
+                    valor_decimal_ou_zero(atual.get(campo))
+                    != valor_decimal_ou_zero(estoque.get(campo))
+                    for campo in campos_estoque[1:]
+                )
+            )
+            if diferente:
+                atualizacoes.append(
+                    tuple(estoque.get(campo) for campo in campos_estoque)
+                    + (tenant_id, cd_empresa, cd_web)
+                )
+
+        existentes_total += existentes_lote
+        if atualizacoes:
+            savepoint = f"sp_produto_estoque_reconciliacao_{inicio_lote}"
+            cursor_web.execute(f"SAVEPOINT {savepoint}")
+            try:
+                cursor_web.executemany(sql_atualizacao, atualizacoes)
+                cursor_web.execute(f"RELEASE SAVEPOINT {savepoint}")
+                atualizados_total += len(atualizacoes)
+            except Exception as exc:
+                try:
+                    cursor_web.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    cursor_web.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except Exception:
+                    pass
+                erros_total += len(atualizacoes)
+                erros_detalhe_total.append(
+                    f"falha ao reconciliar {len(atualizacoes)} estoques reaproveitados: {exc}"
+                )
+
+        inseridos, erros, erros_detalhe = inserir_registros_web(
+            cursor_web,
+            tabelas_web['produto_estoque'],
+            registros,
+            'cd_produto',
+            f"sp_produto_estoque_reaproveitado_{inicio_lote}"
+        )
+        inseridos_total += inseridos
+        erros_total += erros
+        erros_detalhe_total.extend(erros_detalhe)
+
+        fim_lote = min(inicio_lote + len(lote), total_produtos)
+        if fim_lote == total_produtos or fim_lote % 10000 < len(lote):
+            print(
+                f"  Progresso estoque reaproveitado: {fim_lote}/{total_produtos} "
+                f"produtos analisados ({inseridos_total} inseridos, "
+                f"{atualizados_total} atualizados, {erros_total} erros)...",
+                flush=True
+            )
+
+    if total_lidos:
         print(
             f"[OK] Produto_estoque para produtos reaproveitados: "
-            f"{inseridos} inseridos para empresa {cd_empresa}, "
-            f"{existentes} ja existiam, {erros} erros."
+            f"{inseridos_total} inseridos para empresa {cd_empresa}, "
+            f"{atualizados_total} atualizados, "
+            f"{existentes_total - atualizados_total} ja estavam iguais, "
+            f"{erros_total} erros."
+        )
+    if conflitos:
+        print(
+            f"[AVISO] {len(conflitos)} conflitos de saldo entre codigos GIV "
+            "reaproveitados; foi mantido o primeiro saldo e os detalhes foram "
+            "registrados no resumo."
         )
     return {
         'tabela': 'produto_estoque',
-        'lidos': len(produtos_web_processados),
-        'inseridos': inseridos,
-        'existentes': existentes,
-        'erros': erros,
-        'erros_detalhe': erros_detalhe,
-        'motivo_existentes': 'estoque do produto ja existia para a empresa Web',
+        'lidos': total_lidos,
+        'inseridos': inseridos_total,
+        'existentes': existentes_total,
+        'atualizados': atualizados_total,
+        'erros': erros_total,
+        'erros_detalhe': erros_detalhe_total,
+        'avisos': conflitos,
+        'motivo_existentes': 'estoque reaproveitado foi conferido e reconciliado com o GIV',
     }
 
 
@@ -7327,6 +7691,145 @@ def carregar_mapa_cliente_rotinas(cursor_giv, cursor_web, tabela_web_cliente, te
     return mapa
 
 
+def chave_caixa_rotina(valor):
+    """Normaliza codigo/descricao de caixa para o de/para GIV -> Web."""
+    codigo = normalizar_codigo_cidade(valor)
+    if isinstance(codigo, int):
+        return ('codigo', codigo)
+
+    texto = normalizar_nome_cidade(valor)
+    if not texto:
+        return None
+    correspondencia = re.match(r'^CAIXA\s+0*(\d+)$', texto)
+    if correspondencia:
+        return ('codigo', int(correspondencia.group(1)))
+    return ('descricao', texto)
+
+
+def carregar_mapa_caixa_rotinas(cursor_giv, cursor_web, tabela_web_caixa, tenant_id, cd_empresa, cd_empresa_giv=None):
+    """
+    Relaciona o numero de caixa do GIV ao cd_caixa real do Web.
+
+    O GIV costuma guardar 1, 2, ... como numero local da caixa. O Web usa
+    uma chave global por tenant, portanto a mesma caixa pode ser 9, 10, ...
+    no destino. A descricao (por exemplo, CAIXA 01) e usada antes de
+    qualquer fallback numerico para evitar gravar um codigo de outro tenant.
+    """
+    valores_origem = set()
+    for tabela, coluna in (
+        ('prevenda', 'nr_caixa_efetivacao'),
+        ('nota_fiscal_saida', 'nr_caixa'),
+        ('caixa_movto', 'nr_caixa'),
+        ('caixa_status', 'nr_caixa'),
+        ('caixa_titulo', 'nr_caixa'),
+    ):
+        if not tabela_giv_tem_coluna(cursor_giv, tabela, coluna):
+            continue
+        where_sql, params = filtro_empresa_giv(cursor_giv, tabela, cd_empresa_giv=cd_empresa_giv)
+        try:
+            cursor_giv.execute(
+                f"""
+                SELECT {coluna}
+                  FROM {tabela}
+                  {where_sql}
+                 GROUP BY {coluna}
+                """,
+                params
+            )
+            valores_origem.update(row[0] for row in cursor_giv.fetchall() if row and row[0] is not None)
+        except Exception as exc:
+            print(f"[AVISO] Nao foi possivel ler caixas do GIV em {tabela}: {exc}")
+
+    cursor_web.execute(
+        f"""
+        SELECT
+            {quote_identificador('cd_caixa')},
+            {quote_identificador('ds_caixa')}
+          FROM {tabela_web_caixa}
+         WHERE {quote_identificador('tenant_id')} = %s
+           AND {quote_identificador('cd_empresa')} = %s
+         ORDER BY {quote_identificador('cd_caixa')}
+        """,
+        (tenant_id, cd_empresa)
+    )
+    caixas_web = cursor_web.fetchall()
+    por_codigo_web = {normalizar_codigo_cidade(cd_caixa): cd_caixa for cd_caixa, _ in caixas_web}
+    por_chave_descricao = {}
+    for cd_caixa, descricao in caixas_web:
+        chave = chave_caixa_rotina(descricao)
+        if chave:
+            por_chave_descricao.setdefault(chave, cd_caixa)
+
+    mapa = {}
+    sem_mapa = []
+    for valor_origem in sorted(valores_origem, key=lambda valor: str(valor)):
+        chave_origem = chave_caixa_rotina(valor_origem)
+        cd_caixa_web = None
+        if chave_origem:
+            # Primeiro tenta uma descricao equivalente (CAIXA 1 == CAIXA 01).
+            cd_caixa_web = por_chave_descricao.get(chave_origem)
+            # Fallback seguro somente se o codigo existir dentro do tenant.
+            if cd_caixa_web is None and chave_origem[0] == 'codigo':
+                cd_caixa_web = por_codigo_web.get(chave_origem[1])
+
+        if cd_caixa_web is None:
+            sem_mapa.append(valor_origem)
+            continue
+
+        mapa[valor_origem] = cd_caixa_web
+        mapa[normalizar_codigo_cidade(valor_origem)] = cd_caixa_web
+        texto_origem = limpar_valor(valor_origem)
+        if texto_origem:
+            mapa[texto_origem] = cd_caixa_web
+        print(f"[OK] Mapa caixa rotinas: GIV {limpar_valor(valor_origem)} -> Web {cd_caixa_web}")
+
+    if sem_mapa:
+        valores = ', '.join(str(valor) for valor in sem_mapa)
+        print(f"[AVISO] Caixas GIV sem de/para no Web (nao serao inventados codigos): {valores}")
+    print(
+        f"[OK] Mapa caixa rotinas concluido: {len(valores_origem)} valores GIV, "
+        f"{len(mapa)} chaves resolvidas, {len(sem_mapa)} sem mapa."
+    )
+    return mapa
+
+
+def atualizar_caixas_em_lote(cursor_web, tabela_web, coluna_chave, atualizacoes, tenant_id, cd_empresa=None):
+    """Atualiza de uma vez os documentos que precisam do cd_caixa Web."""
+    if not atualizacoes:
+        return 0
+
+    # pg8000 envia parametros sem tipo definido como texto; as chaves e o
+    # nr_caixa do Web sao inteiros, portanto tipamos os dois lados do VALUES.
+    valores_sql = ', '.join(['(CAST(%s AS integer), CAST(%s AS integer))'] * len(atualizacoes))
+    params = []
+    for chave, cd_caixa in atualizacoes:
+        params.extend((chave, cd_caixa))
+
+    coluna_chave_sql = quote_identificador(coluna_chave)
+    filtros = [
+        f"alvo.{quote_identificador('tenant_id')} = %s",
+        f"alvo.{coluna_chave_sql} = origem.{coluna_chave_sql}",
+        f"alvo.{quote_identificador('nr_caixa')} IS DISTINCT FROM origem.{quote_identificador('nr_caixa')}",
+    ]
+    params.append(tenant_id)
+    if cd_empresa is not None:
+        filtros.insert(1, f"alvo.{quote_identificador('cd_empresa')} = %s")
+        params.append(cd_empresa)
+
+    cursor_web.execute(
+        f"""
+        UPDATE {tabela_web} AS alvo
+           SET {quote_identificador('nr_caixa')} = origem.{quote_identificador('nr_caixa')}
+          FROM (VALUES {valores_sql}) AS origem(
+              {coluna_chave_sql}, {quote_identificador('nr_caixa')}
+          )
+         WHERE {' AND '.join(filtros)}
+        """,
+        params
+    )
+    return cursor_web.rowcount
+
+
 def carregar_mapa_produto_rotinas(
     cursor_giv,
     cursor_web,
@@ -8122,12 +8625,33 @@ def processar_banco_contas(
     max_conta = sincronizar_sequence_com_max(cursor_web, tabela_web_banco_conta, 'cd_conta', sequence_conta)
     print(f"[OK] Sequence de banco_conta: {sequence_conta} (sincronizada com max={max_conta}).")
 
-    codigos = iter(reservar_valores_sequence(cursor_web, sequence_conta, len(contas_giv)))
-    registros = []
+    cursor_web.execute(
+        f"""
+        SELECT cd_conta, cd_banco, nr_conta, nr_agencia, ds_conta
+          FROM {tabela_web_banco_conta}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+         ORDER BY cd_conta
+        """,
+        (tenant_id, cd_empresa)
+    )
+    existentes_por_chave_completa = {}
+    existentes_por_chave_conta = {}
+    for cd_conta, cd_banco, nr_conta, nr_agencia, ds_conta in cursor_web.fetchall():
+        chave_completa = (
+            cd_banco,
+            chave_texto(nr_conta),
+            chave_texto(nr_agencia),
+            chave_texto(ds_conta),
+        )
+        chave_conta = (cd_banco, chave_texto(nr_conta), chave_texto(nr_agencia))
+        existentes_por_chave_completa.setdefault(chave_completa, cd_conta)
+        existentes_por_chave_conta.setdefault(chave_conta, cd_conta)
+
+    candidatos = []
     mapa = {}
     erros_detalhe = []
     for conta in contas_giv:
-        cd_conta_web = next(codigos)
         cd_banco_giv = conta.get('cd_banco')
         cd_banco_web = mapa_bancos.get(cd_banco_giv) or mapa_bancos.get(normalizar_codigo_cidade(cd_banco_giv))
         if cd_banco_web is None:
@@ -8140,23 +8664,67 @@ def processar_banco_contas(
             continue
 
         cd_conta_giv = conta.get('cd_conta')
-        mapa[(conta.get('cd_empresa'), cd_conta_giv)] = cd_conta_web
-        mapa[cd_conta_giv] = cd_conta_web
-        mapa[normalizar_codigo_cidade(cd_conta_giv)] = cd_conta_web
-        registros.append(limpar_registro({
-            'cd_conta': cd_conta_web,
+        registro = limpar_registro({
             'cd_banco': cd_banco_web,
-            'nr_conta': limpar_valor(conta.get('nr_conta')) or str(cd_conta_giv or cd_conta_web),
-            'ds_conta': limpar_valor(conta.get('ds_conta')) or f"CONTA {cd_conta_giv or cd_conta_web}",
+            'nr_conta': limpar_valor(conta.get('nr_conta')) or str(cd_conta_giv),
+            'ds_conta': limpar_valor(conta.get('ds_conta')) or f"CONTA {cd_conta_giv}",
             'nr_agencia': limpar_valor(conta.get('nr_agencia')),
             'vl_saldo': valor_decimal_ou_zero(conta.get('vl_saldo')),
             'vl_limite': valor_decimal_ou_zero(conta.get('vl_limite')),
             'id_ativa': 'S' if valor_flag(conta.get('id_ativa'), 'S') in ('S', 'A') else 'N',
             'cd_empresa': cd_empresa,
             'tenant_id': tenant_id,
-        }))
+        })
+        candidatos.append((conta, cd_banco_web, registro))
 
-    aplicar_limites_texto_web(cursor_web, tabela_web_banco_conta, registros, 'banco_conta')
+    # O Web pode ter varchar menor que o GIV. Aplicar o mesmo limite antes da
+    # comparacao e antes do insert evita duplicar uma conta cuja descricao foi
+    # truncada numa execucao anterior.
+    aplicar_limites_texto_web(
+        cursor_web,
+        tabela_web_banco_conta,
+        [registro for _, _, registro in candidatos],
+        'banco_conta'
+    )
+
+    pendentes = []
+    reaproveitados = 0
+    for conta, cd_banco_web, registro in candidatos:
+        cd_conta_giv = conta.get('cd_conta')
+        chave_completa = (
+            cd_banco_web,
+            chave_texto(registro.get('nr_conta')),
+            chave_texto(registro.get('nr_agencia')),
+            chave_texto(registro.get('ds_conta')),
+        )
+        chave_conta = (
+            cd_banco_web,
+            chave_texto(registro.get('nr_conta')),
+            chave_texto(registro.get('nr_agencia')),
+        )
+        cd_conta_web = (
+            existentes_por_chave_completa.get(chave_completa)
+            or existentes_por_chave_conta.get(chave_conta)
+        )
+        if cd_conta_web is not None:
+            mapa[(conta.get('cd_empresa'), cd_conta_giv)] = cd_conta_web
+            mapa[cd_conta_giv] = cd_conta_web
+            mapa[normalizar_codigo_cidade(cd_conta_giv)] = cd_conta_web
+            reaproveitados += 1
+            continue
+        pendentes.append((conta, registro))
+
+    codigos = iter(reservar_valores_sequence(cursor_web, sequence_conta, len(pendentes)))
+    registros = []
+    for conta, registro in pendentes:
+        cd_conta_web = next(codigos)
+        cd_conta_giv = conta.get('cd_conta')
+        mapa[(conta.get('cd_empresa'), cd_conta_giv)] = cd_conta_web
+        mapa[cd_conta_giv] = cd_conta_web
+        mapa[normalizar_codigo_cidade(cd_conta_giv)] = cd_conta_web
+        registro['cd_conta'] = cd_conta_web
+        registros.append(registro)
+
     inseridos, erros_insert, erros_insert_detalhe = inserir_registros_web(
         cursor_web,
         tabela_web_banco_conta,
@@ -8170,7 +8738,7 @@ def processar_banco_contas(
         'tabela': 'banco_conta',
         'lidos': len(contas_giv),
         'inseridos': inseridos,
-        'existentes': 0,
+        'existentes': reaproveitados,
         'erros': len(erros_detalhe),
         'erros_detalhe': erros_detalhe,
     }
@@ -8192,6 +8760,17 @@ def carregar_mapa_banco_conta_rotinas(
         'cd_empresa, cd_conta',
         cd_empresa_giv=cd_empresa_giv
     )
+    contas_giv = [dict(conta) for conta in contas_giv]
+    aplicar_limites_texto_web(
+        cursor_web,
+        tabela_web_banco_conta,
+        contas_giv,
+        'banco_conta para mapeamento'
+    )
+    for conta in contas_giv:
+        cd_conta_giv = conta.get('cd_conta')
+        conta['nr_conta'] = limpar_valor(conta.get('nr_conta')) or str(cd_conta_giv)
+        conta['ds_conta'] = limpar_valor(conta.get('ds_conta')) or f"CONTA {cd_conta_giv}"
     cursor_web.execute(
         f"""
         SELECT cd_conta, cd_banco, nr_conta, nr_agencia, ds_conta
@@ -8262,6 +8841,17 @@ def processar_cartao_administradoras(cursor_giv, cursor_web, tabela_web_cartao, 
         'cd_administradora'
     )
     print(f"[OK] {len(administradoras_giv)} administradoras encontradas no GIV.")
+
+    # A descricao precisa ser normalizada com o mesmo limite da coluna Web
+    # antes de procurar uma administradora existente. Sem isso, uma descricao
+    # longa gravada truncada na primeira execucao nunca seria reaproveitada.
+    administradoras_giv = [dict(admin) for admin in administradoras_giv]
+    aplicar_limites_texto_web(
+        cursor_web,
+        tabela_web_cartao,
+        administradoras_giv,
+        'cartao_administradora'
+    )
 
     sequence_cartao = buscar_sequence_coluna_web(cursor_web, tabela_web_cartao, 'cd_administradora')
     max_cartao = sincronizar_sequence_com_max(cursor_web, tabela_web_cartao, 'cd_administradora', sequence_cartao)
@@ -8341,6 +8931,13 @@ def carregar_mapa_cartao_administradora_rotinas(cursor_giv, cursor_web, tabela_w
         cursor_giv,
         'cartao_administradora',
         'cd_administradora'
+    )
+    administradoras_giv = [dict(admin) for admin in administradoras_giv]
+    aplicar_limites_texto_web(
+        cursor_web,
+        tabela_web_cartao,
+        administradoras_giv,
+        'cartao_administradora para mapeamento'
     )
     cursor_web.execute(
         f"""
@@ -8930,12 +9527,27 @@ def processar_pedido_compra_rotina(cursor_giv, cursor_web, tabelas_web, mapas, t
     )
     print(f"[OK] {len(pedidos_giv)} pedidos e {len(itens_giv)} itens encontrados no GIV.")
 
-    usados = buscar_set_coluna_web(cursor_web, tabelas_web['pedido_compra'], 'nr_pedido', tenant_id=tenant_id)
+    cursor_web.execute(
+        f"""
+        SELECT nr_pedido, cd_fornecedor
+          FROM {tabelas_web['pedido_compra']}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+        """,
+        (tenant_id, cd_empresa)
+    )
+    pedidos_existentes = {
+        nr_pedido: cd_fornecedor
+        for nr_pedido, cd_fornecedor in cursor_web.fetchall()
+    }
+    usados = set(pedidos_existentes)
     max_pedido = max([0] + [int(v or 0) for v in usados])
     registros = []
     mapa_pedido = {}
     erros_detalhe = []
     renumerados = 0
+    existentes_pedidos = 0
+    status_por_pedido = {}
     for pedido in pedidos_giv:
         chave_origem = (pedido.get('cd_empresa'), pedido.get('nr_pedido'))
         motivos = []
@@ -8953,7 +9565,11 @@ def processar_pedido_compra_rotina(cursor_giv, cursor_web, tabelas_web, mapas, t
             continue
 
         nr_origem = int(pedido.get('nr_pedido') or 0)
-        if nr_origem > max_pedido and nr_origem not in usados:
+        nr_existente = pedidos_existentes.get(nr_origem)
+        if nr_existente is not None and nr_existente == cd_fornecedor:
+            nr_web = nr_origem
+            existentes_pedidos += 1
+        elif nr_origem > max_pedido and nr_origem not in usados:
             nr_web = nr_origem
             usados.add(nr_web)
         else:
@@ -8962,12 +9578,16 @@ def processar_pedido_compra_rotina(cursor_giv, cursor_web, tabelas_web, mapas, t
             if nr_web != nr_origem:
                 renumerados += 1
         mapa_pedido[chave_origem] = nr_web
+        status_por_pedido[nr_web] = map_status_pedido_compra(pedido.get('id_situacao'))
+
+        if nr_web == nr_origem and nr_existente is not None and nr_existente == cd_fornecedor:
+            continue
 
         cd_transportador = mapas['fornecedor'].get(pedido.get('cd_transportador')) if pedido.get('cd_transportador') else None
         registros.append(limpar_registro({
             'nr_pedido': nr_web,
             'tenant_id': tenant_id,
-            'id_status': map_status_pedido_compra(pedido.get('id_situacao')),
+            'id_status': status_por_pedido[nr_web],
             'cd_empresa': cd_empresa,
             'cd_fornecedor': cd_fornecedor,
             'cd_transportador': cd_transportador,
@@ -9013,10 +9633,22 @@ def processar_pedido_compra_rotina(cursor_giv, cursor_web, tabelas_web, mapas, t
     erros_detalhe.extend(erros_insert_detalhe)
     mapa_pedido = remover_mapa_por_codigos_erro(mapa_pedido, erros_insert_detalhe, 'nr_pedido')
 
+    cursor_web.execute(
+        f"""
+        SELECT nr_pedido, nr_item
+          FROM {tabelas_web['pedido_compra_item']}
+         WHERE tenant_id = %s
+        """,
+        (tenant_id,)
+    )
+    itens_existentes_por_pedido = {}
+    for nr_pedido_item, nr_item in cursor_web.fetchall():
+        itens_existentes_por_pedido.setdefault(nr_pedido_item, set()).add(nr_item)
+
     itens = []
     ordinal_por_pedido = {}
     erros_itens = []
-    status_por_pedido = {reg['nr_pedido']: reg['id_status'] for reg in registros}
+    itens_existentes = 0
     for item in itens_giv:
         chave = (item.get('cd_empresa'), item.get('nr_pedido'))
         nr_pedido_web = mapa_pedido.get(chave)
@@ -9033,8 +9665,12 @@ def processar_pedido_compra_rotina(cursor_giv, cursor_web, tabelas_web, mapas, t
             registrar_erro_validacao(erros_itens, 'pedido_compra_item', f"nr_pedido={item.get('nr_pedido')} produto={item.get('cd_produto')}", '; '.join(motivos))
             continue
         ordinal_por_pedido[nr_pedido_web] = ordinal_por_pedido.get(nr_pedido_web, 0) + 1
+        nr_item_web = ordinal_por_pedido[nr_pedido_web]
+        if nr_item_web in itens_existentes_por_pedido.get(nr_pedido_web, set()):
+            itens_existentes += 1
+            continue
         itens.append(limpar_registro({
-            'nr_item': ordinal_por_pedido[nr_pedido_web],
+            'nr_item': nr_item_web,
             'nr_pedido': nr_pedido_web,
             'tenant_id': tenant_id,
             'id_status': 'C' if status_por_pedido.get(nr_pedido_web) == 'C' else 'A',
@@ -9073,16 +9709,16 @@ def processar_pedido_compra_rotina(cursor_giv, cursor_web, tabelas_web, mapas, t
             'tabela': 'pedido_compra',
             'lidos': len(pedidos_giv),
             'inseridos': inseridos,
-            'existentes': 0,
+            'existentes': existentes_pedidos,
             'erros': len(erros_detalhe),
             'erros_detalhe': erros_detalhe,
-            'motivo_existentes': 'numero reaproveitado/renumerado por de-para em memoria',
+            'motivo_existentes': 'pedido ja existente no tenant/empresa e localizado por numero + fornecedor',
         },
         {
             'tabela': 'pedido_compra_item',
             'lidos': len(itens_giv),
             'inseridos': inseridos_itens,
-            'existentes': 0,
+            'existentes': itens_existentes,
             'erros': len(erros_itens),
             'erros_detalhe': erros_itens,
         },
@@ -9110,12 +9746,13 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
     max_nf = sincronizar_sequence_com_max(cursor_web, tabelas_web['nota_fiscal_entrada'], 'nf_id', sequence_nf)
     print(f"[OK] Sequence nota_fiscal_entrada: {sequence_nf} (sincronizada com max={max_nf}).")
 
-    codigos = iter(reservar_valores_sequence(cursor_web, sequence_nf, len(notas_giv)))
     registros = []
-    mapa_nf = {}
+    mapa_nf_existente = dict(mapas.get('nf_entrada') or {})
+    mapa_nf = dict(mapa_nf_existente)
     erros_detalhe = []
+    notas_pendentes = []
+    existentes_notas = 0
     for nota in notas_giv:
-        nf_id = next(codigos)
         chave = (nota.get('cd_empresa'), nota.get('nr_nota'), serie_doc(nota.get('serie')), nota.get('cd_fornecedor'))
         motivos = []
         cd_fornecedor = mapas['fornecedor'].get(nota.get('cd_fornecedor'))
@@ -9130,6 +9767,20 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
         if motivos:
             registrar_erro_validacao(erros_detalhe, 'nota_fiscal_entrada', f"nr_nota={nota.get('nr_nota')} serie={nota.get('serie')}", '; '.join(motivos))
             continue
+
+        nf_id_existente = mapa_nf.get(chave)
+        if nf_id_existente is None and cd_empresa_giv is not None:
+            nf_id_existente = mapa_nf.get((cd_empresa, chave[1], chave[2], chave[3]))
+        if nf_id_existente is not None:
+            mapa_nf[chave] = nf_id_existente
+            existentes_notas += 1
+            continue
+
+        notas_pendentes.append((chave, nota, cd_fornecedor, cd_condicao, cd_usuario))
+
+    codigos = iter(reservar_valores_sequence(cursor_web, sequence_nf, len(notas_pendentes)))
+    for chave, nota, cd_fornecedor, cd_condicao, cd_usuario in notas_pendentes:
+        nf_id = next(codigos)
         mapa_nf[chave] = nf_id
         registros.append(limpar_registro({
             'nf_id': nf_id,
@@ -9184,7 +9835,20 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
     # A PK do Web e (tenant_id, nf_id, nr_item), mas o GIV pode repetir
     # nr_item dentro da mesma nota. O Web usa a posicao valida do item e
     # preserva o numero original em nr_item_xml_origem.
+    cursor_web.execute(
+        f"""
+        SELECT nf_id, nr_item
+          FROM {tabelas_web['nota_fiscal_entrada_item']}
+         WHERE tenant_id = %s
+        """,
+        (tenant_id,)
+    )
+    itens_existentes_por_nf = {}
+    for nf_id_item, nr_item in cursor_web.fetchall():
+        itens_existentes_por_nf.setdefault(nf_id_item, set()).add(nr_item)
+
     ordinal = {}
+    itens_existentes = 0
     for item in itens_giv:
         chave = (item.get('cd_empresa'), item.get('nr_nota'), serie_doc(item.get('serie')), item.get('cd_fornecedor'))
         nf_id = mapa_nf.get(chave)
@@ -9201,8 +9865,12 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
             registrar_erro_validacao(erros_itens, 'nota_fiscal_entrada_item', f"nf={item.get('nr_nota')} item={item.get('nr_item')}", '; '.join(motivos))
             continue
         ordinal[nf_id] = ordinal.get(nf_id, 0) + 1
+        nr_item_web = ordinal[nf_id]
+        if nr_item_web in itens_existentes_por_nf.get(nf_id, set()):
+            itens_existentes += 1
+            continue
         itens.append(limpar_registro({
-            'nr_item': ordinal[nf_id],
+            'nr_item': nr_item_web,
             'nr_item_xml_origem': item.get('nr_item'),
             'nf_id': nf_id,
             'tenant_id': tenant_id,
@@ -9257,7 +9925,7 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
             'tabela': 'nota_fiscal_entrada',
             'lidos': len(notas_giv),
             'inseridos': inseridos,
-            'existentes': 0,
+            'existentes': existentes_notas,
             'erros': len(erros_detalhe),
             'erros_detalhe': erros_detalhe,
         },
@@ -9265,7 +9933,7 @@ def processar_nota_fiscal_entrada_rotina(cursor_giv, cursor_web, tabelas_web, ma
             'tabela': 'nota_fiscal_entrada_item',
             'lidos': len(itens_giv),
             'inseridos': inseridos_itens,
-            'existentes': 0,
+            'existentes': itens_existentes,
             'erros': len(erros_itens),
             'erros_detalhe': erros_itens,
         },
@@ -9297,12 +9965,33 @@ def processar_prevenda_rotina(cursor_giv, cursor_web, tabelas_web, mapas, tenant
     )
     print(f"[OK] {len(prevendas_giv)} prevendas e {len(itens_giv)} itens encontrados no GIV.")
 
-    usados = buscar_set_coluna_web(cursor_web, tabelas_web['prevenda'], 'nr_prevenda', tenant_id=tenant_id, cd_empresa=cd_empresa)
+    cursor_web.execute(
+        f"""
+        SELECT nr_prevenda, cd_cliente, nr_caixa
+          FROM {tabelas_web['prevenda']}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+         """,
+        (tenant_id, cd_empresa)
+    )
+    prevendas_existentes = {
+        nr_prevenda: {
+            'cd_cliente': cd_cliente,
+            'nr_caixa': nr_caixa,
+        }
+        for nr_prevenda, cd_cliente, nr_caixa in cursor_web.fetchall()
+    }
+    usados = set(prevendas_existentes)
     max_prevenda = max([0] + [int(v or 0) for v in usados])
     registros = []
     mapa_prevenda = {}
     erros_detalhe = []
     renumerados = 0
+    existentes_prevendas = 0
+    caixas_atualizados = 0
+    caixas_sem_mapa = 0
+    atualizacoes_caixa = []
+    status_por_prevenda = {}
     for prevenda in prevendas_giv:
         motivos = []
         cd_cliente = mapas['cliente'].get((prevenda.get('cd_empresa_cliente'), prevenda.get('cd_cliente'))) or mapas['cliente'].get(prevenda.get('cd_cliente'))
@@ -9328,7 +10017,23 @@ def processar_prevenda_rotina(cursor_giv, cursor_web, tabelas_web, mapas, tenant
             continue
 
         nr_origem = int(prevenda.get('nr_prevenda') or 0)
-        if nr_origem > max_prevenda and nr_origem not in usados:
+        existente = prevendas_existentes.get(nr_origem)
+        nr_existente = existente.get('cd_cliente') if existente else None
+        nr_caixa_origem = prevenda.get('nr_caixa_efetivacao')
+        nr_caixa_web = mapas.get('caixa', {}).get(nr_caixa_origem)
+        if nr_caixa_web is None:
+            nr_caixa_web = mapas.get('caixa', {}).get(normalizar_codigo_cidade(nr_caixa_origem))
+        if nr_caixa_origem is not None and nr_caixa_web is None:
+            caixas_sem_mapa += 1
+        if nr_existente is not None and nr_existente == cd_cliente:
+            nr_web = nr_origem
+            existentes_prevendas += 1
+            if (
+                nr_caixa_web is not None
+                and existente.get('nr_caixa') != nr_caixa_web
+            ):
+                atualizacoes_caixa.append((nr_web, nr_caixa_web))
+        elif nr_origem > max_prevenda and nr_origem not in usados:
             nr_web = nr_origem
             usados.add(nr_web)
         else:
@@ -9337,6 +10042,10 @@ def processar_prevenda_rotina(cursor_giv, cursor_web, tabelas_web, mapas, tenant
             if nr_web != nr_origem:
                 renumerados += 1
         mapa_prevenda[(prevenda.get('cd_empresa'), prevenda.get('nr_prevenda'))] = nr_web
+        status_por_prevenda[nr_web] = map_status_prevenda(prevenda.get('id_situacao'))
+
+        if nr_existente is not None and nr_existente == cd_cliente and nr_web == nr_origem:
+            continue
 
         vl_acrescimo_total = valor_decimal_ou_zero(prevenda.get('vl_acrescimo_total'))
         vl_acrescimo_item = valor_decimal_ou_zero(prevenda.get('vl_acrescimo_total_item'))
@@ -9344,7 +10053,7 @@ def processar_prevenda_rotina(cursor_giv, cursor_web, tabelas_web, mapas, tenant
             'nr_prevenda': nr_web,
             'cd_empresa': cd_empresa,
             'tenant_id': tenant_id,
-            'id_status': map_status_prevenda(prevenda.get('id_situacao')),
+            'id_status': status_por_prevenda[nr_web],
             'dt_emissao': valor_data_ou_agora(prevenda.get('dt_emissao')),
             'nr_identificacao': prevenda.get('nr_cupom'),
             'cd_cliente': cd_cliente,
@@ -9365,12 +10074,20 @@ def processar_prevenda_rotina(cursor_giv, cursor_web, tabelas_web, mapas, tenant
             'vl_total': valor_decimal_ou_zero(prevenda.get('vl_total')),
             'observacao': prevenda.get('obs'),
             'cd_usuario_caixa': cd_usuario,
-            'nr_caixa': prevenda.get('nr_caixa_efetivacao'),
+            'nr_caixa': nr_caixa_web,
             'cd_usuario_cancelamento': mapas['usuario'].get(prevenda.get('cd_usuario_cancela')),
             'dt_cancelamento': prevenda.get('dt_cancela'),
             'motivo_cancelamento': prevenda.get('motivo_cancela'),
         }))
 
+    caixas_atualizados = atualizar_caixas_em_lote(
+        cursor_web,
+        tabelas_web['prevenda'],
+        'nr_prevenda',
+        atualizacoes_caixa,
+        tenant_id,
+        cd_empresa
+    )
     if renumerados:
         print(f"[INFO] Prevenda: {renumerados} prevendas receberam novo numero para evitar colisao/reversao.")
     aplicar_limites_texto_web(cursor_web, tabelas_web['prevenda'], registros, 'prevenda')
@@ -9384,10 +10101,23 @@ def processar_prevenda_rotina(cursor_giv, cursor_web, tabelas_web, mapas, tenant
     erros_detalhe.extend(erros_insert_detalhe)
     mapa_prevenda = remover_mapa_por_codigos_erro(mapa_prevenda, erros_insert_detalhe, 'nr_prevenda')
 
+    cursor_web.execute(
+        f"""
+        SELECT cd_empresa, nr_prevenda, nr_item
+          FROM {tabelas_web['prevenda_item']}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+        """,
+        (tenant_id, cd_empresa)
+    )
+    itens_existentes_por_prevenda = {}
+    for empresa_item, nr_prevenda_item, nr_item in cursor_web.fetchall():
+        itens_existentes_por_prevenda.setdefault((empresa_item, nr_prevenda_item), set()).add(nr_item)
+
     itens = []
     erros_itens = []
     ordinal = {}
-    status_por_prevenda = {reg['nr_prevenda']: reg['id_status'] for reg in registros}
+    itens_existentes = 0
     for item in itens_giv:
         nr_prevenda_web = mapa_prevenda.get((item.get('cd_empresa'), item.get('nr_prevenda')))
         if nr_prevenda_web is None:
@@ -9404,8 +10134,12 @@ def processar_prevenda_rotina(cursor_giv, cursor_web, tabelas_web, mapas, tenant
             registrar_erro_validacao(erros_itens, 'prevenda_item', f"prevenda={item.get('nr_prevenda')} produto={item.get('cd_produto')}", '; '.join(motivos))
             continue
         ordinal[nr_prevenda_web] = ordinal.get(nr_prevenda_web, 0) + 1
+        nr_item_web = ordinal[nr_prevenda_web]
+        if nr_item_web in itens_existentes_por_prevenda.get((cd_empresa, nr_prevenda_web), set()):
+            itens_existentes += 1
+            continue
         itens.append(limpar_registro({
-            'nr_item': ordinal[nr_prevenda_web],
+            'nr_item': nr_item_web,
             'nr_prevenda': nr_prevenda_web,
             'cd_empresa': cd_empresa,
             'tenant_id': tenant_id,
@@ -9436,9 +10170,14 @@ def processar_prevenda_rotina(cursor_giv, cursor_web, tabelas_web, mapas, tenant
     )
     erros_itens.extend(erros_insert_itens_detalhe)
 
+    if caixas_atualizados:
+        print(f"[OK] Prevenda: {caixas_atualizados} caixas corrigidas no de/para GIV -> Web.")
+    if caixas_sem_mapa:
+        print(f"[AVISO] Prevenda: {caixas_sem_mapa} registros tinham caixa GIV sem de/para; nr_caixa ficou vazio.")
+
     return mapa_prevenda, [
-        {'tabela': 'prevenda', 'lidos': len(prevendas_giv), 'inseridos': inseridos, 'existentes': 0, 'erros': len(erros_detalhe), 'erros_detalhe': erros_detalhe},
-        {'tabela': 'prevenda_item', 'lidos': len(itens_giv), 'inseridos': inseridos_itens, 'existentes': 0, 'erros': len(erros_itens), 'erros_detalhe': erros_itens},
+        {'tabela': 'prevenda', 'lidos': len(prevendas_giv), 'inseridos': inseridos, 'existentes': existentes_prevendas, 'caixa_atualizados': caixas_atualizados, 'erros': len(erros_detalhe), 'erros_detalhe': erros_detalhe},
+        {'tabela': 'prevenda_item', 'lidos': len(itens_giv), 'inseridos': inseridos_itens, 'existentes': itens_existentes, 'erros': len(erros_itens), 'erros_detalhe': erros_itens},
     ]
 
 
@@ -9510,13 +10249,33 @@ def processar_condicionais_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
         total['qt'] += valor_decimal_ou_zero(item.get('qt_cotada'))
         total['vl'] += valor_decimal_ou_zero(item.get('vl_total_item'))
 
-    codigos = iter(reservar_valores_sequence(cursor_web, sequence_condicional, len(condicionais_giv)))
+    cursor_web.execute(
+        f"""
+        SELECT nr_condicional, cd_cliente, dt_digitacao, vl_total, qt_produto_total
+          FROM {tabelas_web['condicional']}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+        """,
+        (tenant_id, cd_empresa)
+    )
+    condicionais_existentes_por_assinatura = {}
+    for nr_existente, cliente_existente, data_existente, total_existente, qt_existente in cursor_web.fetchall():
+        assinatura = (
+            cliente_existente,
+            chave_data(data_existente),
+            valor_decimal_ou_zero(total_existente),
+            valor_decimal_ou_zero(qt_existente),
+        )
+        condicionais_existentes_por_assinatura.setdefault(assinatura, []).append(nr_existente)
+
     registros = []
     mapa_condicional = {}
     erros_detalhe = []
     amostras_depara = []
+    condicionais_pendentes = []
+    existentes_condicionais = 0
+    status_por_condicional = {}
     for condicional in condicionais_giv:
-        nr_condicional_web = next(codigos)
         chave_origem = (condicional.get('cd_empresa'), condicional.get('nr_orcamento'))
         cd_cliente = (
             mapas['cliente'].get((condicional.get('cd_empresa_cliente'), condicional.get('cd_cliente')))
@@ -9549,17 +10308,38 @@ def processar_condicionais_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
 
         total_item = totais_itens.get(chave_origem, {'qt': Decimal('0'), 'vl': Decimal('0')})
         vl_total = valor_decimal_ou_zero(condicional.get('vl_total_orcamento')) or total_item['vl']
+        assinatura = (
+            cd_cliente,
+            chave_data(condicional.get('dt_emissao')),
+            valor_decimal_ou_zero(vl_total),
+            valor_decimal_ou_zero(total_item['qt']),
+        )
+        candidatos_existentes = condicionais_existentes_por_assinatura.get(assinatura, [])
+        nr_condicional_web = candidatos_existentes.pop(0) if candidatos_existentes else None
+        if nr_condicional_web is not None:
+            existentes_condicionais += 1
         mapa_condicional[chave_origem] = nr_condicional_web
+        status_por_condicional[nr_condicional_web] = map_status_condicional(condicional.get('id_situacao'))
         if len(amostras_depara) < 5:
             amostras_depara.append(
-                f"GIV {condicional.get('nr_orcamento')} -> Web {nr_condicional_web} "
+                f"GIV {condicional.get('nr_orcamento')} -> Web {nr_condicional_web or 'novo'} "
                 f"cliente={cd_cliente} valor={vl_total}"
             )
+        if nr_condicional_web is None:
+            condicionais_pendentes.append(
+                (chave_origem, condicional, cd_cliente, cd_usuario, vl_total, total_item)
+            )
+
+    codigos = iter(reservar_valores_sequence(cursor_web, sequence_condicional, len(condicionais_pendentes)))
+    for chave_origem, condicional, cd_cliente, cd_usuario, vl_total, total_item in condicionais_pendentes:
+        nr_condicional_web = next(codigos)
+        mapa_condicional[chave_origem] = nr_condicional_web
+        status_por_condicional[nr_condicional_web] = map_status_condicional(condicional.get('id_situacao'))
         registros.append(limpar_registro({
             'nr_condicional': nr_condicional_web,
             'cd_empresa': cd_empresa,
             'tenant_id': tenant_id,
-            'id_status': map_status_condicional(condicional.get('id_situacao')),
+            'id_status': status_por_condicional[nr_condicional_web],
             'dt_digitacao': combinar_data_hora(condicional.get('dt_emissao'), condicional.get('hr_digitacao')),
             'cd_cliente': cd_cliente,
             'cd_usuario_digitacao': cd_usuario,
@@ -9588,10 +10368,23 @@ def processar_condicionais_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
     mapa_condicional = remover_mapa_por_codigos_erro(mapa_condicional, erros_insert_detalhe, 'nr_condicional')
     print(f"[OK] Condicionais inseridos no Web: {inseridos}; nao inseridos: {len(erros_detalhe)}.")
 
+    cursor_web.execute(
+        f"""
+        SELECT cd_empresa, nr_condicional, nr_item
+          FROM {tabelas_web['condicional_item']}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+        """,
+        (tenant_id, cd_empresa)
+    )
+    itens_existentes_por_condicional = {}
+    for empresa_item, nr_condicional_item, nr_item in cursor_web.fetchall():
+        itens_existentes_por_condicional.setdefault((empresa_item, nr_condicional_item), set()).add(nr_item)
+
     itens = []
     erros_itens = []
     ordinal = {}
-    status_por_condicional = {reg['nr_condicional']: reg['id_status'] for reg in registros}
+    itens_existentes = 0
     for item in itens_giv:
         nr_condicional_web = mapa_condicional.get((item.get('cd_empresa'), item.get('nr_orcamento')))
         if nr_condicional_web is None:
@@ -9609,6 +10402,10 @@ def processar_condicionais_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
             continue
 
         ordinal[nr_condicional_web] = ordinal.get(nr_condicional_web, 0) + 1
+        nr_item_web = ordinal[nr_condicional_web]
+        if nr_item_web in itens_existentes_por_condicional.get((cd_empresa, nr_condicional_web), set()):
+            itens_existentes += 1
+            continue
         status_item = 'C' if status_por_condicional.get(nr_condicional_web) == 'C' else 'A'
         qt_produto = valor_decimal_ou_zero(item.get('qt_cotada'))
         qt_faturado = valor_decimal_ou_zero(item.get('qt_atendida'))
@@ -9616,7 +10413,7 @@ def processar_condicionais_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
         vl_unitario = valor_decimal_ou_zero(item.get('vl_unitario'))
         vl_custo = valor_decimal_ou_zero(item.get('vl_custo'))
         itens.append(limpar_registro({
-            'nr_item': ordinal[nr_condicional_web],
+            'nr_item': nr_item_web,
             'nr_condicional': nr_condicional_web,
             'cd_empresa': cd_empresa,
             'tenant_id': tenant_id,
@@ -9657,7 +10454,7 @@ def processar_condicionais_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
             'tabela': 'condicional',
             'lidos': len(condicionais_giv),
             'inseridos': inseridos,
-            'existentes': 0,
+            'existentes': existentes_condicionais,
             'erros': len(erros_detalhe),
             'erros_detalhe': erros_detalhe,
         },
@@ -9665,7 +10462,7 @@ def processar_condicionais_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
             'tabela': 'condicional_item',
             'lidos': len(itens_giv),
             'inseridos': inseridos_itens,
-            'existentes': 0,
+            'existentes': itens_existentes,
             'erros': len(erros_itens),
             'erros_detalhe': erros_itens,
         },
@@ -9729,8 +10526,38 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
     erros_detalhe = []
     nf_ids_novos = set()
     clientes_padrao = 0
+    caixas_atualizados = 0
+    caixas_sem_mapa = 0
+    atualizacoes_caixa = []
     empresa = mapas.get('empresa') or {}
     cliente_padrao = mapas.get('cliente_padrao')
+
+    # Corrige tambem infos ja existentes. O GIV usa o numero local da caixa
+    # (normalmente 1), enquanto o Web usa o cd_caixa global do tenant.
+    for nota in notas_giv:
+        chave = (nota.get('cd_empresa'), nota.get('nr_nota'), serie_doc(nota.get('serie')))
+        nf_id_existente = mapa_nf_existente.get(chave)
+        if nf_id_existente is None:
+            continue
+        nr_caixa_origem = nota.get('nr_caixa')
+        nr_caixa_web = mapas.get('caixa', {}).get(nr_caixa_origem)
+        if nr_caixa_web is None:
+            nr_caixa_web = mapas.get('caixa', {}).get(normalizar_codigo_cidade(nr_caixa_origem))
+        if nr_caixa_origem is not None and nr_caixa_web is None:
+            caixas_sem_mapa += 1
+            continue
+        if nr_caixa_web is None:
+            continue
+        atualizacoes_caixa.append((nf_id_existente, nr_caixa_web))
+
+    caixas_atualizados = atualizar_caixas_em_lote(
+        cursor_web,
+        tabelas_web['nota_fiscal_saida_info'],
+        'nf_id',
+        atualizacoes_caixa,
+        tenant_id
+    )
+
     for chave, nota in notas_novas:
         nf_id = next(codigos)
         motivos = []
@@ -9753,6 +10580,12 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
         nf_ids_novos.add(nf_id)
         vl_acrescimo = valor_decimal_ou_zero(nota.get('vl_acrescimo'))
         vl_acrescimo_item = valor_decimal_ou_zero(nota.get('vl_acrescimo_total_item'))
+        nr_caixa_origem = nota.get('nr_caixa')
+        nr_caixa_web = mapas.get('caixa', {}).get(nr_caixa_origem)
+        if nr_caixa_web is None:
+            nr_caixa_web = mapas.get('caixa', {}).get(normalizar_codigo_cidade(nr_caixa_origem))
+        if nr_caixa_origem is not None and nr_caixa_web is None:
+            caixas_sem_mapa += 1
         registros.append(limpar_registro({
             'nf_id': nf_id,
             'tenant_id': tenant_id,
@@ -9805,7 +10638,7 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
                 'dt_cancelamento': nota.get('dt_cancela'),
                 'motivo_cancelamento': nota.get('motivo_cancela'),
                 'cd_usuario_caixa': mapas['usuario'].get(nota.get('cd_usuario_impressao')) or cd_usuario,
-                'nr_caixa': nota.get('nr_caixa'),
+                'nr_caixa': nr_caixa_web,
                 'dt_impressao': nota.get('dt_impressao'),
                 'id_nfe_cancelamento_apos_prazo': valor_flag(nota.get('id_nfe_cancelamento_apos_prazo'), 'N'),
                 'cliente_nome_nfce': nota.get('ds_cliente_nfce') or nota.get('nm_cliente'),
@@ -9933,6 +10766,11 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
     )
     erros_itens.extend(erros_insert_itens_detalhe)
 
+    if caixas_atualizados:
+        print(f"[OK] Nota fiscal de saida: {caixas_atualizados} caixas corrigidas no de/para GIV -> Web.")
+    if caixas_sem_mapa:
+        print(f"[AVISO] Nota fiscal de saida: {caixas_sem_mapa} registros tinham caixa GIV sem de/para; nr_caixa ficou vazio.")
+
     return mapa_nf, [
         {
             'tabela': 'nota_fiscal_saida',
@@ -9947,6 +10785,7 @@ def processar_nota_fiscal_saida_rotina(cursor_giv, cursor_web, tabelas_web, mapa
             'lidos': len(notas_giv),
             'inseridos': inseridos_info,
             'existentes': len(notas_giv) - len(notas_novas),
+            'caixa_atualizados': caixas_atualizados,
             'erros': erros_info,
             'erros_detalhe': erros_info_detalhe,
         },
@@ -9982,12 +10821,26 @@ def processar_titulo_receber_rotina(cursor_giv, cursor_web, tabelas_web, mapas, 
     max_tr = sincronizar_sequence_com_max(cursor_web, tabelas_web['titulo_receber'], 'tr_id', sequence_tr)
     print(f"[OK] Sequence titulo_receber: {sequence_tr} (sincronizada com max={max_tr}).")
 
-    codigos = iter(reservar_valores_sequence(cursor_web, sequence_tr, len(titulos_giv)))
+    cursor_web.execute(
+        f"""
+        SELECT tr_id, nr_titulo, nr_parcela, serie, cd_cliente
+          FROM {tabelas_web['titulo_receber']}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+        """,
+        (tenant_id, cd_empresa)
+    )
+    titulos_receber_existentes = {
+        (nr_titulo, nr_parcela, serie_doc(serie), cd_cliente): tr_id
+        for tr_id, nr_titulo, nr_parcela, serie, cd_cliente in cursor_web.fetchall()
+    }
+
     registros = []
     mapa_tr = {}
     erros_detalhe = []
+    titulos_pendentes = []
+    existentes_titulos = 0
     for titulo in titulos_giv:
-        tr_id = next(codigos)
         chave = (
             titulo.get('cd_empresa'),
             titulo.get('nr_titulo'),
@@ -10009,7 +10862,6 @@ def processar_titulo_receber_rotina(cursor_giv, cursor_web, tabelas_web, mapas, 
         if motivos:
             registrar_erro_validacao(erros_detalhe, 'titulo_receber', f"titulo={titulo.get('nr_titulo')}/{titulo.get('nr_parcela')}", '; '.join(motivos))
             continue
-        mapa_tr[chave] = tr_id
         valores_titulo = calcular_valores_titulo_receber(titulo)
         status = map_status_titulo_receber(
             titulo.get('id_situacao'),
@@ -10019,6 +10871,19 @@ def processar_titulo_receber_rotina(cursor_giv, cursor_web, tabelas_web, mapas, 
         obs = limpar_valor(titulo.get('obs'))
         if (limpar_valor(titulo.get('id_situacao')) or '').upper() == 'NG':
             obs = ((obs + ' | ') if obs else '') + 'NEGOCIADO NO GIV'
+        tr_existente = titulos_receber_existentes.get(
+            (titulo.get('nr_titulo'), titulo.get('nr_parcela'), serie_doc(titulo.get('serie')), cd_cliente)
+        )
+        if tr_existente is not None:
+            mapa_tr[chave] = tr_existente
+            existentes_titulos += 1
+            continue
+        titulos_pendentes.append((chave, titulo, cd_cliente, cd_condicao, cd_forma, valores_titulo, status, obs))
+
+    codigos = iter(reservar_valores_sequence(cursor_web, sequence_tr, len(titulos_pendentes)))
+    for chave, titulo, cd_cliente, cd_condicao, cd_forma, valores_titulo, status, obs in titulos_pendentes:
+        tr_id = next(codigos)
+        mapa_tr[chave] = tr_id
         registros.append(limpar_registro({
             'tr_id': tr_id,
             'tenant_id': tenant_id,
@@ -10057,13 +10922,32 @@ def processar_titulo_receber_rotina(cursor_giv, cursor_web, tabelas_web, mapas, 
     erros_detalhe.extend(erros_insert_detalhe)
     mapa_tr = remover_mapa_por_codigos_erro(mapa_tr, erros_insert_detalhe, 'tr_id')
 
+    cursor_web.execute(
+        f"""
+        SELECT tr_id, dt_historico, ds_historico, nm_coluna,
+               vl_coluna_anterior, vl_coluna_novo
+          FROM {tabelas_web['titulo_receber_historico']}
+         WHERE tenant_id = %s
+        """,
+        (tenant_id,)
+    )
+    historicos_receber_existentes = {}
+    for tr_id_existente, data_existente, descricao_existente, coluna_existente, anterior_existente, novo_existente in cursor_web.fetchall():
+        assinatura = (
+            tr_id_existente,
+            chave_data(data_existente),
+            limitar_texto(limpar_valor(descricao_existente) or 'Historico GIV', 1000),
+            coluna_existente,
+            str(anterior_existente),
+            str(novo_existente),
+        )
+        historicos_receber_existentes.setdefault(assinatura, []).append(True)
+
     historicos = []
+    historicos_pendentes = []
     erros_hist = []
-    sequence_trh = buscar_sequence_coluna_web(cursor_web, tabelas_web['titulo_receber_historico'], 'trh_id')
-    sincronizar_sequence_com_max(cursor_web, tabelas_web['titulo_receber_historico'], 'trh_id', sequence_trh)
-    codigos_hist = iter(reservar_valores_sequence(cursor_web, sequence_trh, len(historicos_giv)))
+    existentes_historicos = 0
     for hist in historicos_giv:
-        trh_id = next(codigos_hist)
         chave = (
             hist.get('cd_empresa'),
             hist.get('nr_titulo'),
@@ -10091,17 +10975,38 @@ def processar_titulo_receber_rotina(cursor_giv, cursor_web, tabelas_web, mapas, 
             nm_coluna = 'id_status'
             anterior = 'A'
             novo = 'L'
-        historicos.append(limpar_registro({
-            'trh_id': trh_id,
+        descricao = limitar_texto(limpar_valor(hist.get('historico')) or 'Historico GIV', 1000)
+        assinatura = (
+            tr_id,
+            chave_data(hist.get('dt_historico')),
+            descricao,
+            nm_coluna,
+            str(anterior),
+            str(novo),
+        )
+        candidatos_existentes = historicos_receber_existentes.get(assinatura, [])
+        if candidatos_existentes:
+            candidatos_existentes.pop()
+            existentes_historicos += 1
+            continue
+        historicos_pendentes.append({
             'tenant_id': tenant_id,
             'tr_id': tr_id,
             'cd_usuario': mapas['usuario'].get(hist.get('cd_usuario')),
             'dt_historico': valor_data_ou_agora(hist.get('dt_historico')),
-            'ds_historico': limpar_valor(hist.get('historico')) or 'Historico GIV',
+            'ds_historico': descricao,
             'nm_coluna': nm_coluna,
             'vl_coluna_anterior': anterior,
             'vl_coluna_novo': novo,
-        }))
+        })
+
+    sequence_trh = buscar_sequence_coluna_web(cursor_web, tabelas_web['titulo_receber_historico'], 'trh_id')
+    sincronizar_sequence_com_max(cursor_web, tabelas_web['titulo_receber_historico'], 'trh_id', sequence_trh)
+    codigos_hist = iter(reservar_valores_sequence(cursor_web, sequence_trh, len(historicos_pendentes)))
+    for registro_historico in historicos_pendentes:
+        registro_historico = dict(registro_historico)
+        registro_historico['trh_id'] = next(codigos_hist)
+        historicos.append(limpar_registro(registro_historico))
 
     aplicar_limites_texto_web(cursor_web, tabelas_web['titulo_receber_historico'], historicos, 'titulo_receber_historico')
     inseridos_hist, erros_insert_hist, erros_insert_hist_detalhe = inserir_registros_web(
@@ -10113,8 +11018,8 @@ def processar_titulo_receber_rotina(cursor_giv, cursor_web, tabelas_web, mapas, 
     )
     erros_hist.extend(erros_insert_hist_detalhe)
     return mapa_tr, [
-        {'tabela': 'titulo_receber', 'lidos': len(titulos_giv), 'inseridos': inseridos, 'existentes': 0, 'erros': len(erros_detalhe), 'erros_detalhe': erros_detalhe},
-        {'tabela': 'titulo_receber_historico', 'lidos': len(historicos_giv), 'inseridos': inseridos_hist, 'existentes': 0, 'erros': len(erros_hist), 'erros_detalhe': erros_hist},
+        {'tabela': 'titulo_receber', 'lidos': len(titulos_giv), 'inseridos': inseridos, 'existentes': existentes_titulos, 'erros': len(erros_detalhe), 'erros_detalhe': erros_detalhe},
+        {'tabela': 'titulo_receber_historico', 'lidos': len(historicos_giv), 'inseridos': inseridos_hist, 'existentes': existentes_historicos, 'erros': len(erros_hist), 'erros_detalhe': erros_hist},
     ]
 
 
@@ -10158,7 +11063,14 @@ def carregar_mapa_nf_saida_existente(
     }
 
 
-def carregar_mapa_nf_entrada_existente(cursor_web, tabela_web_nf_entrada, mapa_fornecedor, tenant_id, cd_empresa):
+def carregar_mapa_nf_entrada_existente(
+    cursor_web,
+    tabela_web_nf_entrada,
+    mapa_fornecedor,
+    tenant_id,
+    cd_empresa,
+    cd_empresa_giv=None
+):
     reverso_fornecedor = {}
     for cd_giv, cd_web in mapa_fornecedor.items():
         reverso_fornecedor.setdefault(cd_web, set()).add(cd_giv)
@@ -10172,10 +11084,11 @@ def carregar_mapa_nf_entrada_existente(cursor_web, tabela_web_nf_entrada, mapa_f
         """,
         (tenant_id, cd_empresa)
     )
+    empresa_origem = cd_empresa_giv if cd_empresa_giv is not None else cd_empresa
     mapa = {}
     for nf_id, nr_nota, serie, cd_fornecedor_web in cursor_web.fetchall():
         for cd_fornecedor_giv in reverso_fornecedor.get(cd_fornecedor_web, ()):
-            mapa[(cd_empresa, nr_nota, serie_doc(serie), cd_fornecedor_giv)] = nf_id
+            mapa[(empresa_origem, nr_nota, serie_doc(serie), cd_fornecedor_giv)] = nf_id
     return mapa
 
 
@@ -10200,12 +11113,26 @@ def processar_titulo_pagar_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
     max_tp = sincronizar_sequence_com_max(cursor_web, tabelas_web['titulo_pagar'], 'tp_id', sequence_tp)
     print(f"[OK] Sequence titulo_pagar: {sequence_tp} (sincronizada com max={max_tp}).")
 
-    codigos = iter(reservar_valores_sequence(cursor_web, sequence_tp, len(titulos_giv)))
+    cursor_web.execute(
+        f"""
+        SELECT tp_id, nr_titulo, nr_parcela, serie, cd_fornecedor
+          FROM {tabelas_web['titulo_pagar']}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+        """,
+        (tenant_id, cd_empresa)
+    )
+    titulos_pagar_existentes = {
+        (nr_titulo, nr_parcela, serie_doc(serie), cd_fornecedor): tp_id
+        for tp_id, nr_titulo, nr_parcela, serie, cd_fornecedor in cursor_web.fetchall()
+    }
+
     registros = []
     mapa_tp = {}
     erros_detalhe = []
+    titulos_pendentes = []
+    existentes_titulos = 0
     for titulo in titulos_giv:
-        tp_id = next(codigos)
         chave = (
             titulo.get('cd_empresa'),
             titulo.get('nr_titulo'),
@@ -10220,9 +11147,21 @@ def processar_titulo_pagar_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
         if motivos:
             registrar_erro_validacao(erros_detalhe, 'titulo_pagar', f"titulo={titulo.get('nr_titulo')}/{titulo.get('nr_parcela')}", '; '.join(motivos))
             continue
-        mapa_tp[chave] = tp_id
         status = map_status_titulo_pagar(titulo.get('id_situacao'), titulo.get('vl_titulo'), titulo.get('vl_pago'))
         obs = limpar_valor(titulo.get('obs'))
+        tp_existente = titulos_pagar_existentes.get(
+            (titulo.get('nr_titulo'), titulo.get('nr_parcela'), serie_doc(titulo.get('serie')), cd_fornecedor)
+        )
+        if tp_existente is not None:
+            mapa_tp[chave] = tp_existente
+            existentes_titulos += 1
+            continue
+        titulos_pendentes.append((chave, titulo, cd_fornecedor, status, obs))
+
+    codigos = iter(reservar_valores_sequence(cursor_web, sequence_tp, len(titulos_pendentes)))
+    for chave, titulo, cd_fornecedor, status, obs in titulos_pendentes:
+        tp_id = next(codigos)
+        mapa_tp[chave] = tp_id
         registros.append(limpar_registro({
             'tp_id': tp_id,
             'tenant_id': tenant_id,
@@ -10269,13 +11208,33 @@ def processar_titulo_pagar_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
     erros_detalhe.extend(erros_insert_detalhe)
     mapa_tp = remover_mapa_por_codigos_erro(mapa_tp, erros_insert_detalhe, 'tp_id')
 
+    cursor_web.execute(
+        f"""
+        SELECT tp_id, dt_historico, ds_historico, nm_coluna,
+               vl_coluna_anterior, vl_coluna_novo, tp_acao
+          FROM {tabelas_web['titulo_pagar_historico']}
+         WHERE tenant_id = %s
+        """,
+        (tenant_id,)
+    )
+    historicos_pagar_existentes = {}
+    for tp_id_existente, data_existente, descricao_existente, coluna_existente, anterior_existente, novo_existente, acao_existente in cursor_web.fetchall():
+        assinatura = (
+            tp_id_existente,
+            chave_data(data_existente),
+            limitar_texto(limpar_valor(descricao_existente) or 'Historico GIV', 1000),
+            coluna_existente,
+            str(anterior_existente),
+            str(novo_existente),
+            acao_existente,
+        )
+        historicos_pagar_existentes.setdefault(assinatura, []).append(True)
+
     historicos = []
+    historicos_pendentes = []
     erros_hist = []
-    sequence_tph = buscar_sequence_coluna_web(cursor_web, tabelas_web['titulo_pagar_historico'], 'tph_id')
-    sincronizar_sequence_com_max(cursor_web, tabelas_web['titulo_pagar_historico'], 'tph_id', sequence_tph)
-    codigos_hist = iter(reservar_valores_sequence(cursor_web, sequence_tph, len(historicos_giv)))
+    existentes_historicos = 0
     for hist in historicos_giv:
-        tph_id = next(codigos_hist)
         chave = (
             hist.get('cd_empresa'),
             hist.get('nr_titulo'),
@@ -10298,18 +11257,41 @@ def processar_titulo_pagar_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
             nm_coluna = 'id_status'
             anterior = 'A'
             novo = 'L'
-        historicos.append(limpar_registro({
-            'tph_id': tph_id,
+        descricao = limitar_texto(limpar_valor(hist.get('historico')) or 'Historico GIV', 1000)
+        tp_acao = map_tp_acao_historico(hist.get('tp_historico'), hist.get('historico'), hist.get('dt_vencto_anterior'), hist.get('dt_vencto_atual'))
+        assinatura = (
+            tp_id,
+            chave_data(hist.get('dt_historico')),
+            descricao,
+            nm_coluna,
+            str(anterior),
+            str(novo),
+            tp_acao,
+        )
+        candidatos_existentes = historicos_pagar_existentes.get(assinatura, [])
+        if candidatos_existentes:
+            candidatos_existentes.pop()
+            existentes_historicos += 1
+            continue
+        historicos_pendentes.append({
             'tenant_id': tenant_id,
             'tp_id': tp_id,
             'cd_usuario': mapas['usuario'].get(hist.get('cd_usuario')),
             'dt_historico': valor_data_ou_agora(hist.get('dt_historico')),
-            'ds_historico': limpar_valor(hist.get('historico')) or 'Historico GIV',
+            'ds_historico': descricao,
             'nm_coluna': nm_coluna,
             'vl_coluna_anterior': anterior,
             'vl_coluna_novo': novo,
-            'tp_acao': map_tp_acao_historico(hist.get('tp_historico'), hist.get('historico'), hist.get('dt_vencto_anterior'), hist.get('dt_vencto_atual')),
-        }))
+            'tp_acao': tp_acao,
+        })
+
+    sequence_tph = buscar_sequence_coluna_web(cursor_web, tabelas_web['titulo_pagar_historico'], 'tph_id')
+    sincronizar_sequence_com_max(cursor_web, tabelas_web['titulo_pagar_historico'], 'tph_id', sequence_tph)
+    codigos_hist = iter(reservar_valores_sequence(cursor_web, sequence_tph, len(historicos_pendentes)))
+    for registro_historico in historicos_pendentes:
+        registro_historico = dict(registro_historico)
+        registro_historico['tph_id'] = next(codigos_hist)
+        historicos.append(limpar_registro(registro_historico))
 
     aplicar_limites_texto_web(cursor_web, tabelas_web['titulo_pagar_historico'], historicos, 'titulo_pagar_historico')
     inseridos_hist, erros_insert_hist, erros_insert_hist_detalhe = inserir_registros_web(
@@ -10321,9 +11303,945 @@ def processar_titulo_pagar_rotina(cursor_giv, cursor_web, tabelas_web, mapas, te
     )
     erros_hist.extend(erros_insert_hist_detalhe)
     return mapa_tp, [
-        {'tabela': 'titulo_pagar', 'lidos': len(titulos_giv), 'inseridos': inseridos, 'existentes': 0, 'erros': len(erros_detalhe), 'erros_detalhe': erros_detalhe},
-        {'tabela': 'titulo_pagar_historico', 'lidos': len(historicos_giv), 'inseridos': inseridos_hist, 'existentes': 0, 'erros': len(erros_hist), 'erros_detalhe': erros_hist},
+        {'tabela': 'titulo_pagar', 'lidos': len(titulos_giv), 'inseridos': inseridos, 'existentes': existentes_titulos, 'erros': len(erros_detalhe), 'erros_detalhe': erros_detalhe},
+        {'tabela': 'titulo_pagar_historico', 'lidos': len(historicos_giv), 'inseridos': inseridos_hist, 'existentes': existentes_historicos, 'erros': len(erros_hist), 'erros_detalhe': erros_hist},
     ]
+
+
+def _flag_movimento_estoque_giv(valor, padrao='I'):
+    """Normaliza as flags E/S/I usadas pelo GIV e pelo Web."""
+    return valor_flag(valor, padrao)
+
+
+def _descricao_operacao_estoque_importada(cd_operacao, descricao):
+    """Cria uma descricao estavel para nao colidir com operacoes nativas do Web."""
+    texto = limpar_valor(descricao) or f"OPERACAO {cd_operacao}"
+    return limitar_texto(f"GIV {cd_operacao} - {texto}", 100)
+
+
+def _origem_movimento_estoque_giv(cd_operacao, descricao, nr_movto):
+    """Classifica movimentos GIV para os filtros historicos do Web.
+
+    Entrada/saida direta e balanco sao os movimentos manuais reconhecidos pelos
+    relatorios do Web. Os demais recebem uma origem neutra, preservando a linha
+    para saldo historico sem transforma-la artificialmente em ajuste manual.
+    """
+    descricao_normalizada = chave_texto(descricao) or ''
+    if cd_operacao in (2, 3) or 'DIRETA' in descricao_normalizada:
+        prefixo = 'MANUAL-GIV'
+    elif cd_operacao in (4, 19) or 'BALANCO' in descricao_normalizada:
+        prefixo = 'BAL-GIV'
+    else:
+        prefixo = 'GIV-MOV'
+    return limitar_texto(f"{prefixo}-{int(nr_movto)}", 20)
+
+
+def processar_operacoes_estoque_rotina(
+    cursor_giv,
+    cursor_web,
+    tabela_web,
+    tenant_id,
+    cd_empresa_giv=None
+):
+    """Importa as definicoes de operacao_estoque do GIV de forma idempotente."""
+    print()
+    print("[...] Processando operacoes de estoque historicas...")
+    operacoes_giv = buscar_registros_giv_tabela(
+        cursor_giv,
+        'operacao_estoque',
+        'cd_operacao_estoque',
+        cd_empresa_giv=cd_empresa_giv
+    )
+    print(f"[OK] {len(operacoes_giv)} operacoes encontradas no GIV.")
+
+    cursor_web.execute(
+        f"""
+        SELECT {quote_identificador('cd_operacao_estoque')},
+               {quote_identificador('ds_operacao_estoque')}
+          FROM {tabela_web}
+         WHERE {quote_identificador('tenant_id')} = %s
+        """,
+        (tenant_id,)
+    )
+    existentes = {
+        limpar_valor(descricao): cd_operacao
+        for cd_operacao, descricao in cursor_web.fetchall()
+        if limpar_valor(descricao)
+    }
+
+    sequence = buscar_sequence_coluna_web(cursor_web, tabela_web, 'cd_operacao_estoque')
+    sincronizar_sequence_com_max(cursor_web, tabela_web, 'cd_operacao_estoque', sequence)
+    mapa = {}
+    inseridos = 0
+    reaproveitados = 0
+    erros = []
+
+    for operacao in operacoes_giv:
+        cd_origem = operacao.get('cd_operacao_estoque')
+        descricao = _descricao_operacao_estoque_importada(
+            cd_origem,
+            operacao.get('ds_operacao_estoque')
+        )
+        cd_web = existentes.get(descricao)
+        if cd_web is not None:
+            reaproveitados += 1
+        else:
+            registro = limpar_registro({
+                'ds_operacao_estoque': descricao,
+                'id_fisico': _flag_movimento_estoque_giv(operacao.get('id_fisico')),
+                'id_disponivel': _flag_movimento_estoque_giv(operacao.get('id_disponivel')),
+                'id_reservado': _flag_movimento_estoque_giv(operacao.get('id_reservado')),
+                'id_transito': _flag_movimento_estoque_giv(operacao.get('id_transito')),
+                'id_pendente': _flag_movimento_estoque_giv(operacao.get('id_pendente')),
+                'id_especial': _flag_movimento_estoque_giv(operacao.get('id_especial')),
+                'tenant_id': tenant_id,
+            })
+            try:
+                cursor_web.execute('SAVEPOINT sp_operacao_estoque')
+                cd_web = inserir_registro_web_retornando(
+                    cursor_web,
+                    tabela_web,
+                    registro,
+                    'cd_operacao_estoque'
+                )
+                cursor_web.execute('RELEASE SAVEPOINT sp_operacao_estoque')
+                existentes[descricao] = cd_web
+                inseridos += 1
+            except Exception as erro:
+                try:
+                    cursor_web.execute('ROLLBACK TO SAVEPOINT sp_operacao_estoque')
+                    cursor_web.execute('RELEASE SAVEPOINT sp_operacao_estoque')
+                except Exception:
+                    pass
+                erros.append(
+                    f"cd_operacao_estoque={cd_origem}: {erro}"
+                )
+                if len(erros) <= 10:
+                    print(f"  [PULO] operacao_estoque {erros[-1]}")
+                continue
+
+        mapa[cd_origem] = cd_web
+        mapa[normalizar_codigo_cidade(cd_origem)] = cd_web
+
+    print(
+        f"[OK] Operacoes de estoque: {inseridos} inseridas, "
+        f"{reaproveitados} reaproveitadas, {len(erros)} erros."
+    )
+    return mapa, {
+        'tabela': 'operacao_estoque',
+        'lidos': len(operacoes_giv),
+        'inseridos': inseridos,
+        'existentes': reaproveitados,
+        'erros': len(erros),
+        'erros_detalhe': erros,
+    }
+
+
+def completar_mapa_produto_movimentos_estoque(
+    cursor_giv,
+    cursor_web,
+    tabelas_web_produto,
+    mapa_produtos,
+    codigos_necessarios,
+    tenant_id,
+    cd_empresa,
+    cd_empresa_giv=None
+):
+    """Completa somente produtos historicos que ficaram fora do mapa principal.
+
+    A rotina de documentos usa o mapa por nome/barcode/variacao. Para uma base
+    retomada, alguns produtos antigos podem estar apenas no de/para estrutural
+    de produto existente. Esse fallback evita perder movimentos de estoque sem
+    criar outro produto.
+    """
+    faltantes = {
+        codigo
+        for codigo in codigos_necessarios
+        if codigo is not None
+        and mapa_produtos.get(codigo) is None
+        and mapa_produtos.get(normalizar_codigo_cidade(codigo)) is None
+    }
+    if not faltantes:
+        return mapa_produtos
+
+    print(
+        f"[...] Completando de/para de {len(faltantes)} produtos usados no historico "
+        "de estoque..."
+    )
+    produtos_giv = buscar_produtos_giv(cursor_giv)
+    produtos_por_codigo = {
+        produto.get('cd_produto'): produto
+        for produto in produtos_giv
+    }
+    produtos_faltantes = [
+        produtos_por_codigo[codigo]
+        for codigo in faltantes
+        if codigo in produtos_por_codigo
+    ]
+    if not produtos_faltantes:
+        return mapa_produtos
+
+    mapas = carregar_mapas_cadastros_produto(
+        cursor_giv,
+        cursor_web,
+        tabelas_web_produto,
+        tenant_id,
+        cd_empresa,
+        cd_empresa_giv=cd_empresa_giv
+    )
+    mapas_auxiliares = carregar_mapas_auxiliares_produto(
+        cursor_giv,
+        cursor_web,
+        tabelas_web_produto,
+        tenant_id,
+        cd_empresa,
+        cd_empresa_giv
+    )
+    mapas.update(mapas_auxiliares)
+    barcodes = buscar_barcodes_produto_giv(cursor_giv)
+    classificacao = classificar_produtos_giv(produtos_giv)
+    mapa_existente, _ = carregar_mapa_produto_existente_tenant(
+        cursor_web,
+        tabelas_web_produto,
+        tenant_id,
+        produtos_giv,
+        barcodes,
+        mapas,
+        classificacao
+    )
+    resolvidos = 0
+    for produto in produtos_faltantes:
+        codigo = produto.get('cd_produto')
+        cd_web = mapa_existente.get(codigo) or mapa_existente.get(normalizar_codigo_cidade(codigo))
+        if cd_web is None:
+            continue
+        mapa_produtos[codigo] = cd_web
+        mapa_produtos[normalizar_codigo_cidade(codigo)] = cd_web
+        resolvidos += 1
+    print(
+        f"[OK] De/para historico completado: {resolvidos}/{len(produtos_faltantes)} "
+        "produtos resolvidos sem novo cadastro."
+    )
+    return mapa_produtos
+
+
+def processar_movimentos_estoque_rotina(
+    cursor_giv,
+    cursor_web,
+    tabela_web,
+    tabelas_web_produto,
+    mapas,
+    mapa_operacoes,
+    usuario_padrao,
+    tenant_id,
+    cd_empresa,
+    cd_empresa_giv=None
+):
+    """Carrega o historico de estoque do GIV preservando saldos anteriores."""
+    print()
+    print("[...] Processando movimento_estoque historico...")
+    movimentos_giv = buscar_registros_giv_tabela(
+        cursor_giv,
+        'movimento_estoque',
+        'nr_movto',
+        cd_empresa_giv=cd_empresa_giv
+    )
+    print(f"[OK] {len(movimentos_giv)} movimentos encontrados no GIV.")
+
+    cursor_web.execute(
+        f"""
+        SELECT {quote_identificador('id_documento_origem')}
+          FROM {tabela_web}
+         WHERE {quote_identificador('tenant_id')} = %s
+           AND {quote_identificador('cd_empresa')} = %s
+           AND {quote_identificador('id_documento_origem')} LIKE %s
+        """,
+        (tenant_id, cd_empresa, '%GIV-%')
+    )
+    origens_existentes = {
+        origem
+        for (origem,) in cursor_web.fetchall()
+        if origem
+    }
+
+    codigos_produto = {movimento.get('cd_produto') for movimento in movimentos_giv}
+    mapas['produto'] = completar_mapa_produto_movimentos_estoque(
+        cursor_giv,
+        cursor_web,
+        tabelas_web_produto,
+        mapas.get('produto', {}),
+        codigos_produto,
+        tenant_id,
+        cd_empresa,
+        cd_empresa_giv
+    )
+
+    registros = []
+    existentes = 0
+    erros_detalhe = []
+    operacoes_giv = {
+        operacao.get('cd_operacao_estoque'): operacao
+        for operacao in buscar_registros_giv_tabela(
+            cursor_giv,
+            'operacao_estoque',
+            'cd_operacao_estoque',
+            cd_empresa_giv=cd_empresa_giv
+        )
+    }
+    for movimento in movimentos_giv:
+        nr_movto = movimento.get('nr_movto')
+        cd_operacao_giv = movimento.get('cd_operacao_estoque')
+        operacao = operacoes_giv.get(cd_operacao_giv) or {}
+        origem = _origem_movimento_estoque_giv(
+            cd_operacao_giv,
+            operacao.get('ds_operacao_estoque'),
+            nr_movto
+        )
+        if origem in origens_existentes:
+            existentes += 1
+            continue
+
+        cd_produto = mapas.get('produto', {}).get(movimento.get('cd_produto'))
+        if cd_produto is None:
+            cd_produto = mapas.get('produto', {}).get(
+                normalizar_codigo_cidade(movimento.get('cd_produto'))
+            )
+        cd_operacao = mapa_operacoes.get(cd_operacao_giv)
+        if cd_operacao is None:
+            cd_operacao = mapa_operacoes.get(normalizar_codigo_cidade(cd_operacao_giv))
+        cd_usuario = mapas.get('usuario', {}).get(movimento.get('cd_usuario'))
+        if cd_usuario is None:
+            cd_usuario = mapas.get('usuario', {}).get(
+                normalizar_codigo_cidade(movimento.get('cd_usuario'))
+            )
+        cd_usuario = cd_usuario or usuario_padrao
+
+        motivos = []
+        if cd_produto is None:
+            motivos.append(f"produto GIV {movimento.get('cd_produto')} sem de/para")
+        if cd_operacao is None:
+            motivos.append(f"operacao GIV {cd_operacao_giv} sem de/para")
+        if cd_usuario is None:
+            motivos.append(f"usuario GIV {movimento.get('cd_usuario')} sem de/para/padrao")
+        if motivos:
+            erros_detalhe.append(
+                f"nr_movto={nr_movto}: {'; '.join(motivos)}"
+            )
+            if len(erros_detalhe) <= 10:
+                print(f"  [PULO] movimento_estoque {erros_detalhe[-1]}")
+            continue
+
+        observacao = limpar_valor(movimento.get('obs')) or ''
+        documento = movimento.get('nr_documento')
+        serie = serie_doc(movimento.get('serie'))
+        if documento is not None:
+            complemento = f"GIV doc {documento}/{serie}" if serie else f"GIV doc {documento}"
+            observacao = f"{observacao} | {complemento}" if observacao else complemento
+        observacao = limitar_texto(observacao, 200)
+        registros.append(limpar_registro({
+            'cd_empresa': cd_empresa,
+            'cd_produto': cd_produto,
+            'cd_usuario': cd_usuario,
+            'cd_operacao_estoque': cd_operacao,
+            'dt_movto': valor_data_ou_agora(movimento.get('dt_movto')),
+            'dt_registro': valor_data_ou_agora(movimento.get('dt_movto')),
+            'qt_movto': valor_decimal_ou_zero(movimento.get('qtd')),
+            'id_operacao_fisico': _flag_movimento_estoque_giv(movimento.get('id_operacao_fisico')),
+            'id_operacao_disponivel': _flag_movimento_estoque_giv(movimento.get('id_operacao_disponivel')),
+            'id_operacao_pendente': _flag_movimento_estoque_giv(operacao.get('id_pendente')),
+            'id_operacao_reservado': _flag_movimento_estoque_giv(operacao.get('id_reservado')),
+            'id_operacao_transito': _flag_movimento_estoque_giv(operacao.get('id_transito')),
+            'id_operacao_especial': _flag_movimento_estoque_giv(operacao.get('id_especial')),
+            'qt_fisico_ant': valor_decimal_ou_zero(movimento.get('qt_fisico_ant')),
+            'qt_disponivel_ant': valor_decimal_ou_zero(movimento.get('qt_disponivel_ant')),
+            'qt_reservado_ant': Decimal('0'),
+            'qt_transito_ant': Decimal('0'),
+            'qt_pendente_ant': Decimal('0'),
+            'qt_especial_ant': Decimal('0'),
+            'obs': observacao,
+            'id_documento_origem': origem,
+            'tenant_id': tenant_id,
+        }))
+
+    aplicar_limites_texto_web(cursor_web, tabela_web, registros, 'movimento_estoque')
+    inseridos, erros_insert, erros_insert_detalhe = inserir_registros_web(
+        cursor_web,
+        tabela_web,
+        registros,
+        'id_documento_origem',
+        'sp_movimento_estoque'
+    )
+    erros_detalhe.extend(erros_insert_detalhe)
+    print(
+        f"[OK] Movimento_estoque: {inseridos} inseridos, {existentes} existentes, "
+        f"{len(erros_detalhe)} erros/pulos."
+    )
+    return {
+        'tabela': 'movimento_estoque',
+        'lidos': len(movimentos_giv),
+        'inseridos': inseridos,
+        'existentes': existentes,
+        'erros': len(erros_detalhe),
+        'erros_detalhe': erros_detalhe,
+    }
+
+
+def _codigo_mapa_rotina(mapa, valor, cd_empresa_giv=None):
+    """Busca um codigo no mapa aceitando chave por empresa e chave simples."""
+    if not mapa or valor is None:
+        return None
+    candidatos = []
+    if cd_empresa_giv is not None:
+        candidatos.append((cd_empresa_giv, valor))
+    candidatos.extend((valor, normalizar_codigo_cidade(valor)))
+    for chave in candidatos:
+        try:
+            resultado = mapa.get(chave)
+        except TypeError:
+            resultado = None
+        if resultado is not None:
+            return resultado
+    return None
+
+
+def _tipo_movimento_bancario_giv(tp_pessoa, id_operacao):
+    """Converte C/F + C/D do GIV para os tipos do extrato bancario Web."""
+    pessoa = (limpar_valor(tp_pessoa) or '').upper()
+    operacao = (limpar_valor(id_operacao) or '').upper()
+    if pessoa == 'C' and operacao == 'C':
+        return 'RECEBIMENTO'
+    if pessoa == 'C' and operacao == 'D':
+        return 'ESTORNO'
+    if pessoa == 'F' and operacao == 'D':
+        return 'PAGAMENTO'
+    if pessoa == 'F' and operacao == 'C':
+        return 'ESTORNO'
+    return None
+
+
+def _tipo_movimentacao_caixa_giv(id_tipo_movto, id_operacao):
+    """Converte os tipos historicos do caixa GIV para o codigo do Web."""
+    tipo = (limpar_valor(id_tipo_movto) or '').upper()
+    operacao = (limpar_valor(id_operacao) or '').upper()
+    if tipo == 'PV':
+        return 'V'
+    if tipo == 'RB':
+        return 'R'
+    if tipo == 'CX' and operacao == 'E':
+        return 'D'
+    if tipo == 'CX' and operacao == 'S':
+        return 'S'
+    return None
+
+
+def carregar_mapas_titulos_movimento_bancario(
+    cursor_web,
+    tabelas_web,
+    tenant_id,
+    cd_empresa
+):
+    """Carrega chaves naturais dos titulos ja existentes no Web."""
+    mapas = {'C': {}, 'F': {}}
+    cursor_web.execute(
+        f"""
+        SELECT tr_id, nr_titulo, nr_parcela, serie, cd_cliente
+          FROM {tabelas_web['titulo_receber']}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+        """,
+        (tenant_id, cd_empresa)
+    )
+    mapas['C'] = {
+        (nr_titulo, nr_parcela, serie_doc(serie), cd_cliente): tr_id
+        for tr_id, nr_titulo, nr_parcela, serie, cd_cliente in cursor_web.fetchall()
+    }
+
+    cursor_web.execute(
+        f"""
+        SELECT tp_id, nr_titulo, nr_parcela, serie, cd_fornecedor
+          FROM {tabelas_web['titulo_pagar']}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+        """,
+        (tenant_id, cd_empresa)
+    )
+    mapas['F'] = {
+        (nr_titulo, nr_parcela, serie_doc(serie), cd_fornecedor): tp_id
+        for tp_id, nr_titulo, nr_parcela, serie, cd_fornecedor in cursor_web.fetchall()
+    }
+    return mapas
+
+
+def processar_movimentos_bancarios_rotina(
+    cursor_giv,
+    cursor_web,
+    tabelas_web,
+    mapas,
+    tenant_id,
+    cd_empresa,
+    cd_empresa_giv=None
+):
+    """Importa banco_movto para os movimentos bancarios dos titulos Web.
+
+    O GIV aceita varios movimentos para a mesma parcela. O Web possui uma
+    chave unica por titulo e tipo no contas a receber, portanto os movimentos
+    sao agregados por titulo/tipo. Quando ha mais de uma conta na mesma
+    parcela, a conta de maior valor e usada e a composicao fica registrada na
+    observacao; o valor total continua preservado.
+    """
+    print()
+    print("[...] Processando movimentos bancarios historicos...")
+    movimentos_giv = buscar_registros_giv_tabela(
+        cursor_giv,
+        'banco_movto',
+        'nr_movto',
+        cd_empresa_giv=cd_empresa_giv
+    )
+    print(f"[OK] {len(movimentos_giv)} movimentos bancarios encontrados no GIV.")
+
+    mapas_titulos = carregar_mapas_titulos_movimento_bancario(
+        cursor_web,
+        tabelas_web,
+        tenant_id,
+        cd_empresa
+    )
+    marcadores_existentes = {'C': set(), 'F': set()}
+    for pessoa, chave_tabela in (
+        ('C', 'titulo_receber_movimento_bancario'),
+        ('F', 'titulo_pagar_movimento_bancario'),
+    ):
+        tabela = tabelas_web.get(chave_tabela)
+        if not tabela:
+            continue
+        cursor_web.execute(
+            f"""
+            SELECT nr_documento
+              FROM {tabela}
+             WHERE tenant_id = %s
+               AND cd_empresa = %s
+               AND nr_documento LIKE %s
+            """,
+            (tenant_id, cd_empresa, f"GIV-BANCO-{pessoa}:%")
+        )
+        marcadores_existentes[pessoa] = {
+            row[0] for row in cursor_web.fetchall() if row and row[0]
+        }
+
+    grupos = {}
+    erros_detalhe = []
+    fora_modelo = 0
+    valor_fora_modelo = Decimal('0')
+    valor_vinculado = Decimal('0')
+    for movimento in movimentos_giv:
+        valor = valor_decimal_ou_zero(movimento.get('vl_movto'))
+        tp_pessoa = (limpar_valor(movimento.get('tp_pessoa')) or '').upper()
+        tipo_movimento = _tipo_movimento_bancario_giv(
+            tp_pessoa,
+            movimento.get('id_operacao')
+        )
+        nr_titulo = movimento.get('nr_titulo')
+        nr_parcela = movimento.get('nr_parcela')
+        cd_pessoa = movimento.get('cd_pessoa')
+        serie = serie_doc(movimento.get('serie'))
+        cd_conta = _codigo_mapa_rotina(
+            mapas.get('banco_conta', {}),
+            movimento.get('cd_conta'),
+            movimento.get('cd_empresa')
+        )
+        cd_pessoa_web = None
+        if tp_pessoa == 'C':
+            cd_pessoa_web = _codigo_mapa_rotina(
+                mapas.get('cliente', {}),
+                cd_pessoa,
+                movimento.get('cd_empresa')
+            )
+        elif tp_pessoa == 'F':
+            cd_pessoa_web = _codigo_mapa_rotina(
+                mapas.get('fornecedor', {}),
+                cd_pessoa,
+                movimento.get('cd_empresa')
+            )
+
+        motivo = None
+        if tp_pessoa not in ('C', 'F'):
+            motivo = 'movimento direto/sem pessoa; nao existe tabela de extrato bancario generico no Web'
+        elif tipo_movimento is None:
+            motivo = f"operacao GIV {movimento.get('id_operacao')} nao reconhecida"
+        elif nr_titulo is None or nr_parcela is None:
+            motivo = 'titulo ou parcela ausente'
+        elif cd_pessoa_web is None:
+            motivo = f"pessoa GIV {cd_pessoa} sem de/para Web"
+        elif cd_conta is None:
+            motivo = f"conta bancaria GIV {movimento.get('cd_conta')} sem de/para Web"
+        else:
+            chave_titulo = (nr_titulo, nr_parcela, serie, cd_pessoa_web)
+            id_titulo = mapas_titulos[tp_pessoa].get(chave_titulo)
+            if id_titulo is None:
+                motivo = (
+                    f"titulo Web nao encontrado para {nr_titulo}/{nr_parcela}/{serie} "
+                    f"pessoa Web {cd_pessoa_web}"
+                )
+
+        if motivo:
+            fora_modelo += 1
+            valor_fora_modelo += valor
+            if len(erros_detalhe) < 20:
+                erros_detalhe.append(
+                    f"nr_movto={movimento.get('nr_movto')}: {motivo}"
+                )
+            continue
+
+        valor_vinculado += valor
+        chave_grupo = (tp_pessoa, id_titulo, tipo_movimento)
+        grupo = grupos.setdefault(
+            chave_grupo,
+            {
+                'tp_pessoa': tp_pessoa,
+                'id_titulo': id_titulo,
+                'tipo_movimento': tipo_movimento,
+                'somas_conta': defaultdict(lambda: Decimal('0')),
+                'linhas': [],
+                'observacoes': [],
+                'ultima_data': None,
+                'ultimo_usuario': None,
+            }
+        )
+        grupo['somas_conta'][cd_conta] += valor
+        grupo['linhas'].append(movimento)
+        observacao = limpar_valor(movimento.get('observacao'))
+        if observacao:
+            grupo['observacoes'].append(observacao)
+        data_movimento = movimento.get('dt_movto') or movimento.get('dt_digitacao')
+        if (
+            grupo['ultima_data'] is None
+            or (data_movimento is not None and data_movimento > grupo['ultima_data'])
+        ):
+            grupo['ultima_data'] = data_movimento
+            grupo['ultimo_usuario'] = _codigo_mapa_rotina(
+                mapas.get('usuario', {}),
+                movimento.get('cd_usuario'),
+                movimento.get('cd_empresa')
+            ) or mapas.get('usuario_padrao')
+
+    registros_por_tabela = {'C': [], 'F': []}
+    existentes = 0
+    valores_importados = Decimal('0')
+    grupos_multiplas_contas = 0
+    for grupo in grupos.values():
+        pessoa = grupo['tp_pessoa']
+        tabela = tabelas_web.get(
+            'titulo_receber_movimento_bancario' if pessoa == 'C'
+            else 'titulo_pagar_movimento_bancario'
+        )
+        if not tabela:
+            erros_detalhe.append(
+                f"titulo={grupo['id_titulo']}: tabela Web de movimento bancario ausente"
+            )
+            continue
+
+        conta_valores = grupo['somas_conta']
+        cd_conta = max(conta_valores, key=conta_valores.get)
+        if len(conta_valores) > 1:
+            grupos_multiplas_contas += 1
+
+        valor_grupo = sum(conta_valores.values(), Decimal('0'))
+        ids = [str(linha.get('nr_movto')) for linha in grupo['linhas']]
+        marcador = f"GIV-BANCO-{pessoa}:{grupo['id_titulo']}:{grupo['tipo_movimento']}"
+        if marcador in marcadores_existentes[pessoa]:
+            existentes += 1
+            continue
+
+        datas = [linha.get('dt_movto') for linha in grupo['linhas'] if linha.get('dt_movto') is not None]
+        inicio = min(datas) if datas else None
+        fim = max(datas) if datas else None
+        contas_txt = ','.join(f"{chave}:{valor}" for chave, valor in sorted(conta_valores.items(), key=lambda item: str(item[0])))
+        observacoes = []
+        if grupo['observacoes']:
+            observacoes.extend(dict.fromkeys(grupo['observacoes']))
+        observacoes.append(f"GIV nr_movto(s): {','.join(ids[:40])}")
+        if len(ids) > 40:
+            observacoes.append(f"(+{len(ids) - 40} movimentos)")
+        if inicio is not None and fim is not None and chave_data(inicio) != chave_data(fim):
+            observacoes.append(f"Periodo GIV: {chave_data(inicio)} a {chave_data(fim)}")
+        if len(conta_valores) > 1:
+            observacoes.append(f"Contas GIV agregadas: {contas_txt}; conta Web escolhida: {cd_conta}")
+        registro = limpar_registro({
+            'tenant_id': tenant_id,
+            'cd_empresa': cd_empresa,
+            'cd_conta': cd_conta,
+            'dt_movimento': grupo['ultima_data'] or datetime.datetime.now(),
+            'tp_movimento': grupo['tipo_movimento'],
+            'ds_tipo_movimento': grupo['tipo_movimento'],
+            'nr_documento': marcador,
+            'ds_observacao': limitar_texto(' | '.join(observacoes), 255),
+            'vl_movimento': valor_grupo,
+            'cd_usuario': grupo['ultimo_usuario'] or mapas.get('usuario_padrao'),
+        })
+        if pessoa == 'C':
+            registro['tr_id'] = grupo['id_titulo']
+        else:
+            registro['tp_id'] = grupo['id_titulo']
+        registros_por_tabela[pessoa].append(registro)
+        valores_importados += valor_grupo
+
+    resumos = []
+    for pessoa, chave_tabela, savepoint in (
+        ('C', 'titulo_receber_movimento_bancario', 'sp_mov_banc_receber'),
+        ('F', 'titulo_pagar_movimento_bancario', 'sp_mov_banc_pagar'),
+    ):
+        tabela = tabelas_web.get(chave_tabela)
+        registros = registros_por_tabela[pessoa]
+        if not tabela:
+            continue
+        aplicar_limites_texto_web(cursor_web, tabela, registros, chave_tabela)
+        inseridos, erros_insert, erros_insert_detalhe = inserir_registros_web(
+            cursor_web,
+            tabela,
+            registros,
+            'nr_documento',
+            savepoint
+        )
+        erros_detalhe.extend(erros_insert_detalhe)
+        resumos.append({
+            'tabela': chave_tabela,
+            'lidos': sum(1 for mov in movimentos_giv if (limpar_valor(mov.get('tp_pessoa')) or '').upper() == pessoa),
+            'grupos': len(registros),
+            'inseridos': inseridos,
+            'existentes': sum(
+                1 for grupo in grupos.values()
+                if grupo['tp_pessoa'] == pessoa
+                and f"GIV-BANCO-{pessoa}:{grupo['id_titulo']}:{grupo['tipo_movimento']}" in marcadores_existentes[pessoa]
+            ),
+            'erros': erros_insert,
+            'erros_detalhe': erros_insert_detalhe,
+        })
+
+    print(
+        f"[OK] Movimentos bancarios: {len(grupos)} grupos de titulos, "
+        f"{sum(item.get('inseridos', 0) for item in resumos)} inseridos, "
+        f"{existentes} existentes, {fora_modelo} fora do modelo/sem de-para."
+    )
+    if grupos_multiplas_contas:
+        print(
+            f"[AVISO] {grupos_multiplas_contas} grupos tinham mais de uma conta GIV; "
+            "o valor foi preservado e a conta de maior valor foi escolhida."
+        )
+    print(
+        f"[INFO] Valor bancario vinculado: {valor_vinculado}; "
+        f"importado: {valores_importados}; fora do modelo: {valor_fora_modelo}."
+    )
+    if erros_detalhe:
+        print("[AVISO] Amostra de movimentos bancarios nao importados:")
+        for detalhe in erros_detalhe[:10]:
+            print(f"  - {detalhe}")
+
+    resumo_geral = {
+        'tabela': 'movimento_bancario',
+        'lidos': len(movimentos_giv),
+        'grupos': len(grupos),
+        'inseridos': sum(item.get('inseridos', 0) for item in resumos),
+        'existentes': existentes,
+        'fora_modelo': fora_modelo,
+        'valor_vinculado': valor_vinculado,
+        'valor_importado': valores_importados,
+        'valor_fora_modelo': valor_fora_modelo,
+        'erros': len(erros_detalhe),
+        'erros_detalhe': erros_detalhe,
+    }
+    return resumos + [resumo_geral]
+
+
+def processar_movimentacoes_caixa_rotina(
+    cursor_giv,
+    cursor_web,
+    tabela_web,
+    mapas,
+    tenant_id,
+    cd_empresa,
+    cd_empresa_giv=None
+):
+    """Importa caixa_movto para caixa_movimentacao sem duplicar historico."""
+    print()
+    print("[...] Processando historico de caixa...")
+    movimentos_giv = buscar_registros_giv_tabela(
+        cursor_giv,
+        'caixa_movto',
+        'nr_movto',
+        cd_empresa_giv=cd_empresa_giv
+    )
+    print(f"[OK] {len(movimentos_giv)} movimentos de caixa encontrados no GIV.")
+
+    # caixa_titulo guarda o titulo efetivamente vinculado ao movimento do
+    # caixa. O nr_documento da caixa_movto nem sempre e o titulo recebido
+    # (ex.: uma linha RB pode guardar o documento da venda anterior). Usar
+    # esse vinculo deixa o demonstrativo do Web capaz de abrir o recebimento
+    # no titulo/parcela correto, sem alterar o valor do movimento de caixa.
+    caixa_titulos_giv = buscar_registros_giv_tabela(
+        cursor_giv,
+        'caixa_titulo',
+        'nr_movto',
+        cd_empresa_giv=cd_empresa_giv
+    )
+    vinculos_caixa_titulo = {}
+    for titulo in caixa_titulos_giv:
+        vinculos_caixa_titulo.setdefault(titulo.get('nr_movto'), titulo)
+    print(
+        f"[OK] {len(caixa_titulos_giv)} vinculos caixa_titulo encontrados no GIV; "
+        f"{len(vinculos_caixa_titulo)} movimentos possuem titulo relacionado."
+    )
+
+    cursor_web.execute(
+        f"""
+        SELECT ds_historico
+          FROM {tabela_web}
+         WHERE tenant_id = %s
+           AND cd_empresa = %s
+           AND ds_historico LIKE 'GIV-MOVTO:%'
+        """,
+        (tenant_id, cd_empresa)
+    )
+    origens_existentes = set()
+    for (historico,) in cursor_web.fetchall():
+        marcador = (limpar_valor(historico) or '').split('|', 1)[0].strip()
+        if marcador.startswith('GIV-MOVTO:'):
+            origens_existentes.add(marcador)
+
+    registros = []
+    existentes = 0
+    erros_detalhe = []
+    tipos = defaultdict(lambda: {'quantidade': 0, 'valor': Decimal('0')})
+    for movimento in movimentos_giv:
+        nr_movto = movimento.get('nr_movto')
+        marcador = f"GIV-MOVTO:{nr_movto}"
+        if marcador in origens_existentes:
+            existentes += 1
+            continue
+
+        tipo = _tipo_movimentacao_caixa_giv(
+            movimento.get('id_tipo_movto'),
+            movimento.get('id_operacao')
+        )
+        cd_caixa = _codigo_mapa_rotina(
+            mapas.get('caixa', {}),
+            movimento.get('nr_caixa')
+        )
+        cd_usuario = _codigo_mapa_rotina(
+            mapas.get('usuario', {}),
+            movimento.get('cd_usuario'),
+            movimento.get('cd_empresa')
+        ) or mapas.get('usuario_padrao')
+        if tipo is None:
+            erros_detalhe.append(
+                f"nr_movto={nr_movto}: tipo GIV {movimento.get('id_tipo_movto')}/{movimento.get('id_operacao')} sem de/para"
+            )
+            continue
+        if cd_caixa is None:
+            erros_detalhe.append(
+                f"nr_movto={nr_movto}: caixa GIV {movimento.get('nr_caixa')} sem de/para Web"
+            )
+            continue
+        if cd_usuario is None:
+            erros_detalhe.append(
+                f"nr_movto={nr_movto}: usuario GIV {movimento.get('cd_usuario')} sem de/para/padrao"
+            )
+            continue
+
+        vinculo_titulo = vinculos_caixa_titulo.get(nr_movto) or {}
+        cliente_origem = (
+            vinculo_titulo.get('cd_cliente')
+            if vinculo_titulo.get('cd_cliente') is not None
+            else movimento.get('cd_cliente')
+        )
+        empresa_cliente_origem = (
+            vinculo_titulo.get('cd_empresa_cliente')
+            if vinculo_titulo.get('cd_empresa_cliente') is not None
+            else movimento.get('cd_empresa')
+        )
+        cd_forma = _codigo_mapa_rotina(
+            mapas.get('forma_pagamento', {}),
+            movimento.get('cd_forma_pagamento'),
+            movimento.get('cd_empresa')
+        )
+        cd_cliente = _codigo_mapa_rotina(
+            mapas.get('cliente', {}),
+            cliente_origem,
+            empresa_cliente_origem
+        )
+        documento = movimento.get('nr_documento')
+        serie = serie_doc(movimento.get('serie'))
+        titulo_vinculado = (
+            vinculo_titulo.get('nr_titulo') is not None
+            and vinculo_titulo.get('nr_parcela') is not None
+        )
+        if titulo_vinculado:
+            serie_titulo = serie_doc(vinculo_titulo.get('serie')) or 'TIT'
+            documento = (
+                f"{serie_titulo}/{vinculo_titulo.get('nr_titulo')}-"
+                f"{vinculo_titulo.get('nr_parcela')}"
+            )
+        elif documento is not None and serie:
+            documento = f"{documento}/{serie}"
+        historico = limpar_valor(movimento.get('historico')) or ''
+        conta = movimento.get('cd_conta')
+        if conta is not None:
+            historico = f"{historico} | GIV conta {conta}" if historico else f"GIV conta {conta}"
+        if titulo_vinculado:
+            historico_titulo = (
+                f"GIV titulo {vinculo_titulo.get('nr_titulo')}/"
+                f"{vinculo_titulo.get('nr_parcela')}/"
+                f"{serie_doc(vinculo_titulo.get('serie'))}"
+            )
+            historico = f"{historico} | {historico_titulo}" if historico else historico_titulo
+        historico = limitar_texto(f"{marcador} | {historico}" if historico else marcador, 255)
+        valor = valor_decimal_ou_zero(movimento.get('vl_movto'))
+        registro = limpar_registro({
+            'cd_caixa': cd_caixa,
+            'dt_movimentacao': valor_data_ou_agora(movimento.get('dt_movto')),
+            'dh_movimentacao': valor_data_ou_agora(
+                movimento.get('dt_manutencao') or movimento.get('dt_movto')
+            ),
+            'vl_movimentacao': valor,
+            'tp_movimentacao': tipo,
+            'usuario_movimentacao': cd_usuario,
+            'cd_empresa': cd_empresa,
+            'tenant_id': tenant_id,
+            'id_operacao': (limpar_valor(movimento.get('id_operacao')) or 'E')[:1],
+            'ds_historico': historico,
+            'nr_documento': documento,
+            'cd_forma_pagamento': cd_forma,
+            'cd_cliente': cd_cliente,
+        })
+        registros.append(registro)
+        tipos[tipo]['quantidade'] += 1
+        tipos[tipo]['valor'] += valor
+
+    aplicar_limites_texto_web(cursor_web, tabela_web, registros, 'caixa_movimentacao')
+    inseridos, erros_insert, erros_insert_detalhe = inserir_registros_web(
+        cursor_web,
+        tabela_web,
+        registros,
+        'ds_historico',
+        'sp_caixa_movimentacao'
+    )
+    erros_detalhe.extend(erros_insert_detalhe)
+    for tipo, dados in sorted(tipos.items()):
+        print(f"  [OK] Caixa {tipo}: {dados['quantidade']} movimentos, valor {dados['valor']}.")
+    print(
+        f"[OK] Historico de caixa: {inseridos} inseridos, {existentes} existentes, "
+        f"{len(erros_detalhe)} erros/pulos."
+    )
+    if erros_detalhe:
+        for detalhe in erros_detalhe[:10]:
+            print(f"  [PULO] caixa_movimentacao {detalhe}")
+    return {
+        'tabela': 'caixa_movimentacao',
+        'lidos': len(movimentos_giv),
+        'inseridos': inseridos,
+        'existentes': existentes,
+        'erros': len(erros_detalhe),
+        'erros_detalhe': erros_detalhe,
+        'tipos': {tipo: dict(dados) for tipo, dados in tipos.items()},
+    }
 
 
 def normalizar_cnpj_web(valor):
@@ -11355,6 +13273,7 @@ def imprimir_resumo(resumos):
         lidos = int(resumo.get('lidos') or 0)
         inseridos = int(resumo.get('inseridos') or 0)
         existentes = int(resumo.get('existentes') or 0)
+        atualizados = int(resumo.get('atualizados') or 0)
         erros = int(resumo.get('erros') or 0)
         nao_inseridos = max(lidos - inseridos, 0)
         sem_detalhe = max(nao_inseridos - existentes - erros, 0)
@@ -11363,6 +13282,8 @@ def imprimir_resumo(resumos):
         print(f"  Tabela:                         {resumo.get('tabela')}")
         print(f"  Total lidos do GIV:             {lidos}")
         print(f"  Inseridos no Web:               {inseridos}")
+        if atualizados:
+            print(f"  Atualizados/reconciliados:      {atualizados}")
         print(f"  Nao inseridos total:            {nao_inseridos}")
         print(f"  Reaproveitados/ja existentes:   {existentes}")
         print(f"  Nao inseridos com erro:         {erros}")
@@ -11376,12 +13297,14 @@ def imprimir_resumo(resumos):
         lidos = int(resumo.get('lidos') or 0)
         inseridos = int(resumo.get('inseridos') or 0)
         existentes = int(resumo.get('existentes') or 0)
+        atualizados = int(resumo.get('atualizados') or 0)
         erros = int(resumo.get('erros') or 0)
         detalhes = resumo.get('erros_detalhe') or []
+        avisos = resumo.get('avisos') or []
         nao_inseridos = max(lidos - inseridos, 0)
         sem_detalhe = max(nao_inseridos - existentes - erros, 0)
 
-        if not existentes and not erros and not sem_detalhe:
+        if not existentes and not atualizados and not erros and not sem_detalhe and not avisos:
             continue
 
         if not encontrou_detalhe:
@@ -11393,6 +13316,14 @@ def imprimir_resumo(resumos):
         print(f"  Tabela {resumo.get('tabela')}:")
         if existentes:
             print(f"    - {existentes} registro(s): {motivo_reaproveitamento_resumo(resumo)}.")
+        if atualizados:
+            print(f"    - {atualizados} registro(s) foram atualizados/reconciliados com o GIV.")
+        if avisos:
+            print(f"    - {len(avisos)} aviso(s):")
+            for aviso in avisos[:20]:
+                print(f"      - {aviso}")
+            if len(avisos) > 20:
+                print(f"      - ... mais {len(avisos) - 20} aviso(s).")
         if sem_detalhe:
             print(
                 f"    - {sem_detalhe} registro(s): nao houve INSERT e a rotina nao retornou "
@@ -12143,6 +14074,8 @@ def capturar_estado_reversao(
         'condicao_pagamento': ('condicao_pagamento', 'cd_condicao_pagto'),
         'forma_pagamento': ('forma_pagamento', 'cd_forma_pagto'),
         'cartao_administradora': ('cartao_administradora', 'cd_administradora'),
+        'operacao_estoque': ('operacao_estoque', 'cd_operacao_estoque'),
+        'movimento_estoque': ('movimento_estoque', 'nr_movto'),
         'condicional': ('condicional', 'nr_condicional'),
         'pedido_compra': ('pedido_compra', 'nr_pedido'),
         'nota_fiscal_entrada': ('nota_fiscal_entrada', 'nf_id'),
@@ -12150,9 +14083,15 @@ def capturar_estado_reversao(
         'nota_fiscal_saida': ('nota_fiscal_saida', 'nf_id'),
         'titulo_receber': ('titulo_receber', 'tr_id'),
         'titulo_pagar': ('titulo_pagar', 'tp_id'),
+        'caixa_movimentacao': ('caixa_movimentacao', 'id_movimentacao'),
+        'movimento_bancario_receber': ('titulo_receber_movimento_bancario', 'id_movimento'),
+        'movimento_bancario_pagar': ('titulo_pagar_movimento_bancario', 'id_movimento'),
     }
     for chave, (nome_tabela, coluna) in defs.items():
         selecionada = chave in tabelas_selecionadas
+        if chave == 'operacao_estoque' and 'movimento_estoque' in tabelas_selecionadas:
+            # Movimento importa automaticamente as definicoes de operacao.
+            selecionada = True
         if chave == 'forma_pagamento':
             selecionada = 'condicao_pagamento' in tabelas_selecionadas
         if selecionada and tabelas_web.get(nome_tabela):
@@ -12177,6 +14116,26 @@ def capturar_estado_reversao(
             'tph_id',
             'tph_id'
         )
+
+    if 'caixa_movimentacao' in tabelas_selecionadas and tabelas_web.get('caixa_movimentacao'):
+        estado['itens']['caixa_movimentacao'] = item_reversao(
+            cursor_web,
+            tabelas_web.get('caixa_movimentacao'),
+            'id_movimentacao',
+            'id_movimentacao'
+        )
+    if 'movimento_bancario' in tabelas_selecionadas:
+        for chave, nome_tabela in (
+            ('movimento_bancario_receber', 'titulo_receber_movimento_bancario'),
+            ('movimento_bancario_pagar', 'titulo_pagar_movimento_bancario'),
+        ):
+            if tabelas_web.get(nome_tabela):
+                estado['itens'][chave] = item_reversao(
+                    cursor_web,
+                    tabelas_web.get(nome_tabela),
+                    'id_movimento',
+                    'id_movimento'
+                )
 
     if 'produto' in tabelas_selecionadas or ROTINAS_COM_PRODUTO.intersection(tabelas_selecionadas):
         produto = tabelas_web.get('produto')
@@ -12676,6 +14635,24 @@ def gerar_sql_reversao(estado, tabelas_web):
     if 'titulo_pagar' in itens:
         linhas.append(delete_maior_que(itens['titulo_pagar']['tabela'], 'tp_id', itens['titulo_pagar']['max'], tenant_id, cd_empresa))
 
+    # O historico de estoque usa uma chave sequencial global; remova primeiro
+    # os movimentos para depois liberar as operacoes importadas.
+    if 'movimento_estoque' in itens:
+        linhas.append(delete_maior_que(
+            itens['movimento_estoque']['tabela'],
+            'nr_movto',
+            itens['movimento_estoque']['max'],
+            tenant_id,
+            cd_empresa
+        ))
+    if 'operacao_estoque' in itens:
+        linhas.append(delete_maior_que(
+            itens['operacao_estoque']['tabela'],
+            'cd_operacao_estoque',
+            itens['operacao_estoque']['max'],
+            tenant_id
+        ))
+
     if 'condicional' in itens:
         limite_condicional = itens['condicional']['max']
         if tabelas_web.get('condicional_item'):
@@ -13002,6 +14979,12 @@ def solicitar_tabelas_para_converter():
         'cartao_administradora': 'cartao_administradora',
         'administradora_cartao': 'cartao_administradora',
         'administradoras_cartao': 'cartao_administradora',
+        '26': 'operacao_estoque',
+        'operacao_estoque': 'operacao_estoque',
+        'operacoes_estoque': 'operacao_estoque',
+        '27': 'movimento_estoque',
+        'movimento_estoque': 'movimento_estoque',
+        'movimentos_estoque': 'movimento_estoque',
         '17': 'pedido_compra',
         'pedido_compra': 'pedido_compra',
         'pedido': 'pedido_compra',
@@ -13023,6 +15006,13 @@ def solicitar_tabelas_para_converter():
         'contas_pagar': 'titulo_pagar',
         'contas_a_pagar': 'titulo_pagar',
         'titulo_pagar': 'titulo_pagar',
+        '28': 'caixa_movimentacao',
+        'caixa_movimentacao': 'caixa_movimentacao',
+        'movimentos_caixa': 'caixa_movimentacao',
+        '29': 'movimento_bancario',
+        'movimento_bancario': 'movimento_bancario',
+        'banco_movto': 'movimento_bancario',
+        'movimentos_bancarios': 'movimento_bancario',
     }
 
     print("Quais tabelas deseja converter?")
@@ -13045,7 +15035,9 @@ def solicitar_tabelas_para_converter():
     print("  23 - banco_conta -> banco_conta")
     print("  16 - condicao_pagto -> condicao_pagamento")
     print("  25 - cartao_administradora -> cartao_administradora")
+    print("  26 - operacao_estoque -> operacao_estoque (historico)")
     print("  14 - produto -> produto/produto_info/produto_preco/estoque")
+    print("  27 - movimento_estoque -> movimento_estoque (historico de saldo/giro)")
     print("  24 - orcamento -> condicional/condicional_item")
     print("  17 - pedido_compra -> pedido_compra/pedido_compra_item")
     print("  18 - nota_fiscal_entrada -> nota_fiscal_entrada/itens")
@@ -13053,11 +15045,13 @@ def solicitar_tabelas_para_converter():
     print("  20 - nota_fiscal_saida -> nota_fiscal_saida/info/itens")
     print("  21 - titulo_receber -> titulo_receber/historico")
     print("  22 - titulo_pagar -> titulo_pagar/historico")
+    print("  28 - caixa_movto -> caixa_movimentacao (historico)")
+    print("  29 - banco_movto -> movimentos bancarios dos titulos")
     print("  T - todas na ordem segura")
     print("Voce pode informar mais de uma opcao, exemplo: 2,9,8,6,11,14,21")
 
     while True:
-        resposta = input("Tabelas [T/0..25]: ").strip().lower()
+        resposta = input("Tabelas [T/0..29]: ").strip().lower()
         if not resposta or resposta in ('t', 'todas', 'todos', 'all'):
             return list(TABELAS_DISPONIVEIS)
 
@@ -13087,7 +15081,7 @@ def solicitar_tabelas_para_converter():
         if selecionadas and not invalidas:
             return [tabela for tabela in TABELAS_DISPONIVEIS if tabela in selecionadas]
 
-        print("Opcao invalida. Use T, 0..24 ou uma lista como 2,9,8,6,11,14,21.")
+        print("Opcao invalida. Use T, 0..29 ou uma lista como 2,9,8,6,11,14,21.")
 
 
 def solicitar_tenant_id():
@@ -13284,7 +15278,11 @@ def main():
             tabela for tabela in AUXILIARES_PRODUTO
             if tabela in tabelas_selecionadas
         ]
-        precisa_auxiliares_produto = bool(auxiliares_produto_selecionados) or 'produto' in tabelas_selecionadas
+        precisa_auxiliares_produto = (
+            bool(auxiliares_produto_selecionados)
+            or 'produto' in tabelas_selecionadas
+            or 'movimento_estoque' in tabelas_selecionadas
+        )
         rotinas_documento_selecionadas = {
             'condicional',
             'pedido_compra',
@@ -13294,9 +15292,21 @@ def main():
             'titulo_receber',
             'titulo_pagar',
         }.intersection(tabelas_selecionadas)
-        precisa_mapas_rotinas = bool(rotinas_documento_selecionadas)
-        precisa_produto_completo = 'produto' in tabelas_selecionadas or bool(
-            ROTINAS_COM_PRODUTO.intersection(tabelas_selecionadas)
+        historico_financeiro_selecionado = {
+            'caixa_movimentacao',
+            'movimento_bancario',
+        }.intersection(tabelas_selecionadas)
+        historico_estoque_selecionado = bool({
+            'operacao_estoque',
+            'movimento_estoque',
+        }.intersection(tabelas_selecionadas))
+        precisa_mapas_rotinas = bool(
+            rotinas_documento_selecionadas or historico_financeiro_selecionado
+        )
+        precisa_produto_completo = (
+            'produto' in tabelas_selecionadas
+            or bool(ROTINAS_COM_PRODUTO.intersection(tabelas_selecionadas))
+            or 'movimento_estoque' in tabelas_selecionadas
         )
         if precisa_mapas_rotinas:
             precisa_auxiliares_produto = True
@@ -13307,19 +15317,34 @@ def main():
                 print(f"[OK] Tabela Web Grupo: {tabela_web_grupo}")
             else:
                 print(f"[OK] Tabela Web Grupo para mapeamento: {tabela_web_grupo}")
-        if 'fornecedor' in tabelas_selecionadas or precisa_produto_completo or precisa_mapas_rotinas:
+        if (
+            'fornecedor' in tabelas_selecionadas
+            or precisa_produto_completo
+            or precisa_mapas_rotinas
+            or 'movimento_bancario' in tabelas_selecionadas
+        ):
             tabela_web_fornecedor = resolver_tabela_web(cursor_web, "fornecedor")
             if 'fornecedor' in tabelas_selecionadas:
                 print(f"[OK] Tabela Web fornecedor: {tabela_web_fornecedor}")
             else:
                 print(f"[OK] Tabela Web fornecedor para mapeamento: {tabela_web_fornecedor}")
-        if 'cliente' in tabelas_selecionadas or precisa_mapas_rotinas:
+        if (
+            'cliente' in tabelas_selecionadas
+            or precisa_mapas_rotinas
+            or 'caixa_movimentacao' in tabelas_selecionadas
+            or 'movimento_bancario' in tabelas_selecionadas
+        ):
             tabela_web_cliente = resolver_tabela_web(cursor_web, "cliente")
             if 'cliente' in tabelas_selecionadas:
                 print(f"[OK] Tabela Web cliente: {tabela_web_cliente}")
             else:
                 print(f"[OK] Tabela Web cliente para mapeamento: {tabela_web_cliente}")
-        if 'usuario' in tabelas_selecionadas or precisa_mapas_rotinas:
+        if (
+            'usuario' in tabelas_selecionadas
+            or precisa_mapas_rotinas
+            or historico_estoque_selecionado
+            or bool(historico_financeiro_selecionado)
+        ):
             tabela_web_usuario = resolver_tabela_web(cursor_web, "usuario")
             if 'usuario' in tabelas_selecionadas:
                 print(f"[OK] Tabela Web usuario: {tabela_web_usuario}")
@@ -13384,25 +15409,45 @@ def main():
             else:
                 print("[OK] Tabelas Web de produto para documentos resolvidas.")
 
-        if 'banco' in tabelas_selecionadas or 'banco_conta' in tabelas_selecionadas or 'titulo_pagar' in tabelas_selecionadas:
+        if historico_estoque_selecionado:
+            tabelas_web_rotinas['operacao_estoque'] = resolver_tabela_web(cursor_web, "operacao_estoque")
+            print(f"[OK] Tabela Web operacao_estoque para historico: {tabelas_web_rotinas['operacao_estoque']}")
+            if 'movimento_estoque' in tabelas_selecionadas:
+                tabelas_web_rotinas['movimento_estoque'] = resolver_tabela_web(cursor_web, "movimento_estoque")
+                print(f"[OK] Tabela Web movimento_estoque para historico: {tabelas_web_rotinas['movimento_estoque']}")
+
+        if (
+            'banco' in tabelas_selecionadas
+            or 'banco_conta' in tabelas_selecionadas
+            or 'titulo_pagar' in tabelas_selecionadas
+            or 'movimento_bancario' in tabelas_selecionadas
+        ):
             tabelas_web_rotinas['banco'] = resolver_tabela_web(cursor_web, "banco")
             if 'banco' in tabelas_selecionadas:
                 print(f"[OK] Tabela Web banco: {tabelas_web_rotinas['banco']}")
             else:
                 print(f"[OK] Tabela Web banco para mapeamento: {tabelas_web_rotinas['banco']}")
-        if 'banco_conta' in tabelas_selecionadas or 'titulo_pagar' in tabelas_selecionadas:
+        if (
+            'banco_conta' in tabelas_selecionadas
+            or 'titulo_pagar' in tabelas_selecionadas
+            or 'movimento_bancario' in tabelas_selecionadas
+        ):
             tabelas_web_rotinas['banco_conta'] = resolver_tabela_web(cursor_web, "banco_conta")
             if 'banco_conta' in tabelas_selecionadas:
                 print(f"[OK] Tabela Web banco_conta: {tabelas_web_rotinas['banco_conta']}")
             else:
                 print(f"[OK] Tabela Web banco_conta para mapeamento: {tabelas_web_rotinas['banco_conta']}")
-        if 'condicao_pagamento' in tabelas_selecionadas or precisa_mapas_rotinas:
+        if (
+            'condicao_pagamento' in tabelas_selecionadas
+            or precisa_mapas_rotinas
+            or bool(historico_financeiro_selecionado)
+        ):
             tabelas_web_rotinas['condicao_pagamento'] = resolver_tabela_web(cursor_web, "condicao_pagamento")
             if 'condicao_pagamento' in tabelas_selecionadas:
                 print(f"[OK] Tabela Web condicao_pagamento: {tabelas_web_rotinas['condicao_pagamento']}")
             else:
                 print(f"[OK] Tabela Web condicao_pagamento para mapeamento: {tabelas_web_rotinas['condicao_pagamento']}")
-        if 'condicao_pagamento' in tabelas_selecionadas:
+        if 'condicao_pagamento' in tabelas_selecionadas or 'caixa_movimentacao' in tabelas_selecionadas:
             tabelas_web_rotinas['condicao_pagamento_forma'] = resolver_tabela_web(cursor_web, "condicao_pagamento_forma")
             tabelas_web_rotinas['forma_pagamento'] = resolver_tabela_web(cursor_web, "forma_pagamento")
             print(f"[OK] Tabela Web condicao_pagamento_forma: {tabelas_web_rotinas['condicao_pagamento_forma']}")
@@ -13433,6 +15478,7 @@ def main():
                 'forma_pagamento': resolver_tabela_web(cursor_web, "forma_pagamento"),
                 'cfop': resolver_tabela_web(cursor_web, "cfop"),
                 'empresa': resolver_tabela_web(cursor_web, "empresa"),
+                'caixa': resolver_tabela_web(cursor_web, "caixa"),
             })
             tabelas_web_rotinas.setdefault('banco_conta', resolver_tabela_web(cursor_web, "banco_conta"))
             tabelas_web_produto.setdefault('produto_info', resolver_tabela_web(cursor_web, "produto_info"))
@@ -13441,6 +15487,29 @@ def main():
             tabelas_web_produto.setdefault('unidade', resolver_tabela_web(cursor_web, "unidade"))
             tabelas_web_produto.setdefault('cor', resolver_tabela_web(cursor_web, "cor"))
             tabelas_web_produto.setdefault('tamanho', resolver_tabela_web(cursor_web, "tamanho"))
+            if 'caixa_movimentacao' in tabelas_selecionadas:
+                tabelas_web_rotinas['caixa_movimentacao'] = resolver_tabela_web(
+                    cursor_web,
+                    "caixa_movimentacao"
+                )
+                print(
+                    f"[OK] Tabela Web historico de caixa: "
+                    f"{tabelas_web_rotinas['caixa_movimentacao']}"
+                )
+            if 'movimento_bancario' in tabelas_selecionadas:
+                tabelas_web_rotinas['titulo_receber_movimento_bancario'] = resolver_tabela_web(
+                    cursor_web,
+                    "titulo_receber_movimento_bancario"
+                )
+                tabelas_web_rotinas['titulo_pagar_movimento_bancario'] = resolver_tabela_web(
+                    cursor_web,
+                    "titulo_pagar_movimento_bancario"
+                )
+                print(
+                    "[OK] Tabelas Web de movimentos bancarios: "
+                    f"{tabelas_web_rotinas['titulo_receber_movimento_bancario']}, "
+                    f"{tabelas_web_rotinas['titulo_pagar_movimento_bancario']}"
+                )
             print("[OK] Tabelas Web das rotinas/documentos resolvidas.")
 
         tabelas_web_reversao = {
@@ -13745,7 +15814,21 @@ def main():
                 )
             )
 
-        if rotinas_documento_selecionadas:
+        mapas_rotinas = {}
+        mapa_operacoes_estoque = {}
+        usuario_padrao_movimento = None
+        if 'operacao_estoque' in tabelas_selecionadas or 'movimento_estoque' in tabelas_selecionadas:
+            gui_progress_tabela('operacao_estoque')
+            mapa_operacoes_estoque, resumo_operacoes_estoque = processar_operacoes_estoque_rotina(
+                cursor_giv,
+                cursor_web,
+                tabelas_web_rotinas['operacao_estoque'],
+                tenant_id,
+                cd_empresa_giv_filtro
+            )
+            resumos.append(resumo_operacoes_estoque)
+
+        if precisa_mapas_rotinas:
             print()
             print("[...] Montando mapas em memoria para rotinas/documentos...")
             if not mapa_bancos and tabelas_web_rotinas.get('banco'):
@@ -13846,6 +15929,15 @@ def main():
                 ),
                 'banco': mapa_bancos,
             }
+            mapa_caixas = carregar_mapa_caixa_rotinas(
+                cursor_giv,
+                cursor_web,
+                tabelas_web_rotinas['caixa'],
+                tenant_id,
+                cd_empresa,
+                cd_empresa_giv_filtro
+            )
+            mapas_rotinas['caixa'] = mapa_caixas
             mapas_rotinas['nf_saida'] = carregar_mapa_nf_saida_existente(
                 cursor_web,
                 tabelas_web_rotinas['nota_fiscal_saida'],
@@ -13858,7 +15950,8 @@ def main():
                 tabelas_web_rotinas['nota_fiscal_entrada'],
                 mapas_rotinas['fornecedor'],
                 tenant_id,
-                cd_empresa
+                cd_empresa,
+                cd_empresa_giv_filtro
             )
 
             mapas_forma, forma_padrao = carregar_mapa_forma_pagamento(
@@ -13979,7 +16072,7 @@ def main():
                 resumos.extend(resumos_nf_saida)
             if 'titulo_receber' in tabelas_selecionadas:
                 gui_progress_tabela('titulo_receber')
-                _, resumos_receber = processar_titulo_receber_rotina(
+                mapa_titulo_receber, resumos_receber = processar_titulo_receber_rotina(
                     cursor_giv,
                     cursor_web,
                     tabelas_web_rotinas,
@@ -13988,10 +16081,11 @@ def main():
                     cd_empresa,
                     cd_empresa_giv_filtro
                 )
+                mapas_rotinas['titulo_receber'] = mapa_titulo_receber
                 resumos.extend(resumos_receber)
             if 'titulo_pagar' in tabelas_selecionadas:
                 gui_progress_tabela('titulo_pagar')
-                _, resumos_pagar = processar_titulo_pagar_rotina(
+                mapa_titulo_pagar, resumos_pagar = processar_titulo_pagar_rotina(
                     cursor_giv,
                     cursor_web,
                     tabelas_web_rotinas,
@@ -14000,7 +16094,79 @@ def main():
                     cd_empresa,
                     cd_empresa_giv_filtro
                 )
+                mapas_rotinas['titulo_pagar'] = mapa_titulo_pagar
                 resumos.extend(resumos_pagar)
+
+        if 'caixa_movimentacao' in tabelas_selecionadas:
+            gui_progress_tabela('caixa_movimentacao')
+            resumos.append(processar_movimentacoes_caixa_rotina(
+                cursor_giv,
+                cursor_web,
+                tabelas_web_rotinas['caixa_movimentacao'],
+                mapas_rotinas,
+                tenant_id,
+                cd_empresa,
+                cd_empresa_giv_filtro
+            ))
+        if 'movimento_bancario' in tabelas_selecionadas:
+            gui_progress_tabela('movimento_bancario')
+            resumos.extend(processar_movimentos_bancarios_rotina(
+                cursor_giv,
+                cursor_web,
+                tabelas_web_rotinas,
+                mapas_rotinas,
+                tenant_id,
+                cd_empresa,
+                cd_empresa_giv_filtro
+            ))
+
+        if 'movimento_estoque' in tabelas_selecionadas:
+            # A carga pode ser executada sozinha ou junto das rotinas de
+            # documentos. Em ambos os casos precisamos de um de/para real,
+            # sem criar produto ou usuario artificial para o historico.
+            if not mapas_rotinas.get('produto'):
+                mapas_aux_movimento = carregar_mapas_auxiliares_produto(
+                    cursor_giv,
+                    cursor_web,
+                    tabelas_web_produto,
+                    tenant_id,
+                    cd_empresa,
+                    cd_empresa_giv_filtro
+                )
+                mapas_rotinas['produto'] = carregar_mapa_produto_rotinas(
+                    cursor_giv,
+                    cursor_web,
+                    tabelas_web_produto,
+                    tenant_id,
+                    mapas_aux_movimento
+                )
+            if not mapas_rotinas.get('usuario'):
+                mapa_usuario_movimento, usuario_padrao_movimento = carregar_mapa_usuario_rotinas(
+                    cursor_giv,
+                    cursor_web,
+                    tabela_web_usuario,
+                    tenant_id,
+                    cd_empresa,
+                    cd_empresa_giv_filtro
+                )
+                mapas_rotinas['usuario'] = mapa_usuario_movimento
+                mapas_rotinas['usuario_padrao'] = usuario_padrao_movimento
+            else:
+                usuario_padrao_movimento = mapas_rotinas.get('usuario_padrao')
+
+            gui_progress_tabela('movimento_estoque')
+            resumos.append(processar_movimentos_estoque_rotina(
+                cursor_giv,
+                cursor_web,
+                tabelas_web_rotinas['movimento_estoque'],
+                tabelas_web_produto,
+                mapas_rotinas,
+                mapa_operacoes_estoque,
+                usuario_padrao_movimento,
+                tenant_id,
+                cd_empresa,
+                cd_empresa_giv_filtro
+            ))
 
         imprimir_resumo(resumos)
         comparar_totais_pos_conversao(
@@ -14032,6 +16198,8 @@ def main():
     except Exception as e:
         print()
         print(f"[ERRO FATAL] {e}")
+        if _valor_booleano_env(os.environ.get('CONVERTER_DEBUG_TRACEBACK')):
+            traceback.print_exc()
         print("[...] Realizando ROLLBACK automatico...")
         try:
             conn_web.rollback()
