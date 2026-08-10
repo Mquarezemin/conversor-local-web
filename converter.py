@@ -1060,7 +1060,9 @@ def buscar_movimentos_credito_cliente_giv(cursor_giv, cd_empresa_giv=None):
             cmc.vl_acrescimo_financeiro
         FROM cliente_movto_credito cmc
         {where_sql}
-        ORDER BY cmc.cd_empresa, cmc.cd_cliente, cmc.nr_movto
+        -- nr_movto e global no GIV. Ordena-lo antes do cliente evita inversao
+        -- quando cadastros GIV distintos convergem para um cliente Web.
+        ORDER BY cmc.nr_movto
     """.format(where_sql=where_sql)
     return buscar_registros_giv(cursor_giv, sql, params if params else None)
 
