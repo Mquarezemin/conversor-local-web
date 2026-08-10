@@ -1050,9 +1050,14 @@ def buscar_movimentos_credito_cliente_giv(cursor_giv, cd_empresa_giv=None):
             cmc.obs_devolucao,
             cmc.cd_produto,
             cmc.qt_produto,
+            cmc.cd_funcionario,
+            cmc.cd_condicao_pagto,
             cmc.id_operacao,
             cmc.nr_devolucao,
-            cmc.vl_custo
+            cmc.vl_custo,
+            cmc.vl_desconto,
+            cmc.vl_acrescimo,
+            cmc.vl_acrescimo_financeiro
         FROM cliente_movto_credito cmc
         {where_sql}
         ORDER BY cmc.cd_empresa, cmc.cd_cliente, cmc.nr_movto
@@ -1100,6 +1105,7 @@ def processar_movimentos_credito_cliente_historico(
     avisos = []
     mapa_clientes = mapas.get('cliente', {})
     mapa_produtos = mapas.get('produto', {})
+    mapa_usuarios = mapas.get('usuario', {})
 
     for movimento in movimentos:
         try:
@@ -1132,6 +1138,18 @@ def processar_movimentos_credito_cliente_historico(
                 if not cd_produto_web:
                     avisos.append(
                         f"nr_movto={nr_movto}: produto GIV {cd_produto_origem} sem mapa; movimento sera preservado sem produto."
+                    )
+
+            cd_usuario_web = None
+            cd_funcionario_origem = movimento.get('cd_funcionario')
+            if cd_funcionario_origem is not None:
+                cd_usuario_web = (
+                    mapa_usuarios.get(cd_funcionario_origem)
+                    or mapa_usuarios.get(normalizar_codigo_cidade(cd_funcionario_origem))
+                )
+                if not cd_usuario_web:
+                    avisos.append(
+                        f"nr_movto={nr_movto}: vendedor GIV {cd_funcionario_origem} sem mapa; relatorio por vendedor nao o atribuira."
                     )
 
             chave_origem = f"GIV:{cd_empresa_origem}:{nr_movto}"
@@ -1179,20 +1197,22 @@ def processar_movimentos_credito_cliente_historico(
             cursor_web.execute(
                 f"""
                 INSERT INTO {tabela_web_credito_historico} (
-                    tenant_id, cd_empresa, cd_cliente, cd_produto, nr_devolucao_origem,
+                    tenant_id, cd_empresa, cd_cliente, cd_produto, cd_usuario, cd_condicao_pagto, nr_devolucao_origem,
                     origem, chave_origem, sequencia_origem, tipo, direcao, valor,
-                    quantidade, vl_custo_unitario, saldo_anterior, saldo_posterior,
+                    quantidade, vl_desconto, vl_acrescimo, vl_custo_unitario, saldo_anterior, saldo_posterior,
                     observacao, dt_movimento
                 ) VALUES (
-                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s,
                     'GIV', %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 """,
                 (
-                    tenant_id, cd_empresa_web, cd_cliente_web, cd_produto_web,
-                    movimento.get('nr_devolucao'), chave_origem, nr_movto, tipo, direcao, valor,
+                    tenant_id, cd_empresa_web, cd_cliente_web, cd_produto_web, cd_usuario_web,
+                    movimento.get('cd_condicao_pagto'), movimento.get('nr_devolucao'), chave_origem, nr_movto, tipo, direcao, valor,
                     quantidade,
+                    valor_decimal_ou_zero(movimento.get('vl_desconto')),
+                    valor_decimal_ou_zero(movimento.get('vl_acrescimo')) + valor_decimal_ou_zero(movimento.get('vl_acrescimo_financeiro')),
                     valor_decimal_ou_zero(movimento.get('vl_custo')) if movimento.get('vl_custo') is not None else None,
                     saldo_anterior, saldo_posterior, observacao, dt_movimento
                 )
